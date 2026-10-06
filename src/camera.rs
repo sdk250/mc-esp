@@ -1,7 +1,3 @@
-/// 用屏幕左边缘标定出来的焦距（3120x1440，游戏内 FOV 60）
-pub const K_CALIBRATED: f32 = 1519.0;
-
-
 /// 第一人称相机：位置 + 朝向 + 屏幕参数
 pub struct Camera {
     pub pos: [f32; 3], // 眼睛坐标，就是 [LP+0x208]
@@ -9,7 +5,7 @@ pub struct Camera {
     pub yaw: f32,      // 度，0 = 面朝 +Z，-90 = 面朝 +X
     pub w: f32,        // 屏幕宽（像素）
     pub h: f32,        // 屏幕高（像素）
-    pub k: f32,        // 焦距（像素），由 FOV 算出
+    pub k: f32,        // 焦距（像素）= 投影矩阵的 a × 半屏宽
 }
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {

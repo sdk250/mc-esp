@@ -4,6 +4,7 @@ mod camera;
 mod game;
 mod overlay;
 mod renderer;
+mod projection;
 
 
 use tracing::{ error, info };
@@ -43,6 +44,10 @@ fn _main() -> Result<()> {
         process.pid, process.base, process.base + VPTR_OFFSET
     );
 
+    // 投影矩阵：GameRenderer + 0x420，每帧从这里读焦距
+    let proj_addr = projection::locate(&process)?;
+    info!("Projection matrix: 0x{:X}", proj_addr);
+
     let actors = scan_actors(&process, process.base + VPTR_OFFSET)?;
     info!("Scaned actors: {}\n{:X?}", actors.len(), actors);
     let mut client_act = 0;
@@ -55,6 +60,7 @@ fn _main() -> Result<()> {
     if client_act == 0 {
         return Err(ESPError::ZeroRead(MODULE));
     }
+
     let entry_addr = fetch_component_addr(
         &process, client_act,
         STORAGE_ID
@@ -71,45 +77,56 @@ fn _main() -> Result<()> {
 
     // diff_actors(&process, &actors)?;
 
-    let (w, h) = (3120.0, 1440.0);
-    loop {
-        use std::{
-            time::Duration,
-            thread::sleep
-        };
+    // 游戏画面（横屏）的尺寸，投影算出的框都在这个坐标系里
+    let (w, h) = (overlay::SCREEN_W as f32, overlay::SCREEN_H as f32);
+    let window = overlay::create_window(overlay::SCREEN_W, overlay::SCREEN_H)?;
+    let mut renderer = renderer::Renderer::new(window, overlay::SCREEN_W, overlay::SCREEN_H)?;
 
-        sleep(Duration::from_millis(200));
+    let mut actors = list_actors(&process, entry_addr)?;
+    let (mut pitch, mut yaw) = (0.0f32, 0.0f32);
+    // 焦距（像素）= 矩阵的 a × 半屏宽。读失败的帧沿用上一帧的值
+    let mut k = projection::read_focal(&process, proj_addr).unwrap_or(1.0) * w / 2.0;
+    let mut outlines = Vec::new();
+    for frame in 0u64.. {
+        // 实体列表每秒左右刷新一次（rtti_name 要读好几次内存，没必要每帧都做）
+        if frame % 60 == 0 {
+            actors = list_actors(&process, entry_addr)?;
+        }
 
+        // 读到 (0,0) 视为读写竞争：沿用上一帧的角度，而不是跳过这一帧（跳过会让框闪烁）
         process.read_into(rotation_addr, &mut buf);
-        let pitch = f32::from_le_bytes(buf[..4].try_into().unwrap());
-        let yaw = f32::from_le_bytes(buf[4..].try_into().unwrap());
-        // 读到 (0,0) 视为读写竞争，跳过这一帧
-        if pitch == 0.0 && yaw == 0.0 { continue; }
+        let p = f32::from_le_bytes(buf[..4].try_into().unwrap());
+        let y = f32::from_le_bytes(buf[4..].try_into().unwrap());
+        if p != 0.0 || y != 0.0 {
+            (pitch, yaw) = (p, y);
+        }
 
-        let xyz = process.read_vec3(process.read_ptr(player.addr + 0x208)?)?;
+        let Ok(player_xyz) = process.read_vec3(process.read_ptr(
+            player.addr + 0x208
+        )?) else { continue; };
+        // FOV 随奔跑、飞行变化，所以焦距每帧都读
+        if let Some(focal) = projection::read_focal(&process, proj_addr) {
+            k = focal * w / 2.0;
+        }
+        let camera = camera::Camera { pos: player_xyz, pitch, yaw, w, h, k };
 
-        let camera = camera::Camera {
-            pos: xyz, pitch, yaw, w, h,
-            k: camera::K_CALIBRATED
-        };
-
-        for actor in list_actors(&process, entry_addr)? {
+        outlines.clear();
+        for actor in &actors {
             if actor.rtti != "6Animal" { continue; }
             let Ok(svc) = process.read_ptr(actor.addr + 0x208) else { continue; };
             let Ok(feet) = process.read_vec3(svc) else { continue; };
-
-            // 距离只是给人看的，用来核对“走近框变大”
-            let d = [feet[0] - xyz[0], feet[1] - xyz[1], feet[2] - xyz[2]];
-            let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-
-            match camera.project_box(feet, 0.9, 1.3) {
-                Some([l, t, r, b]) => info!(
-                    "0x{:X} dist {:5.1}  [{:6.0}, {:6.0}, {:6.0}, {:6.0}]  size {:4.0}x{:4.0}",
-                    actor.addr, dist, l, t, r, b, r - l, b - t
-                ),
-                None => info!("0x{:X} dist {:5.1}  身后", actor.addr, dist),
+            if let Some(rect) = camera.project_box(feet, 1.0, 1.3) {
+                outlines.push(renderer::Outline {
+                    rect,
+                    color: [1.0, 0.0, 0.0, 1.0],
+                    thickness: 2.0,
+                });
             }
-        }    }
+        }
+
+        // FIFO 模式下 draw 会等到下一次垂直同步，循环自然就按屏幕刷新率运行
+        renderer.draw(&outlines)?;
+    }
 
     Ok(())
 }
