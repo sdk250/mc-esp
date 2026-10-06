@@ -3,7 +3,7 @@
 //! 不用 shader 和图形管线：每个框拆成上、下、左、右四条实心细长矩形，
 //! 在 RenderPass 里用 vkCmdClearAttachments 把这些区域直接“清”成框的颜色。
 //!
-//! 坐标系是图层的坐标系：屏幕自然方向（竖屏），原点在左上角，x 向右、y 向下，单位像素。
+//! 坐标系是图层的坐标系：逻辑显示坐标（横屏时就是游戏画面的坐标），原点在左上角，x 向右、y 向下，单位像素。
 //!
 //! 有必要说明一下，这部分代码是由 Anthropic 公司的 AI 模型 Claude5.5编写的，我并不具备 Rust 图形开发的经验
 //! 更别提这是完全基于底层 Vulkan API 进行渲染，其中有非常多的图形接口的学习成本都是非常高的
@@ -12,6 +12,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use ash::vk;
+use tracing::info;
 
 use crate::error::{ ESPError, Result };
 
@@ -68,14 +69,14 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// 在 `window`（overlay::create_window 的返回值）上初始化 Vulkan
+    /// 在 `window`（overlay::create_window 的返回值）上初始化 Vulkan，`width`、`height` 是图层尺寸
     ///
     /// 中途失败时已创建的对象不会被释放；这只发生在启动阶段，进程随后就退出了。
-    pub fn new(window: NonNull<c_void>) -> Result<Self> {
-        unsafe { Self::init(window) }
+    pub fn new(window: NonNull<c_void>, width: u32, height: u32) -> Result<Self> {
+        unsafe { Self::init(window, width, height) }
     }
 
-    unsafe fn init(window: NonNull<c_void>) -> Result<Self> { unsafe {
+    unsafe fn init(window: NonNull<c_void>, width: u32, height: u32) -> Result<Self> { unsafe {
         // ---- Instance：加载驱动，启用“从 ANativeWindow 创建 surface”所需的两个扩展 ----
         let entry = ash::Entry::load()
             .map_err(|e| ESPError::Custom(MODULE, format!("load libvulkan.so: {e}").into()))?;
@@ -135,7 +136,17 @@ impl Renderer {
         let caps = surface_fn
             .get_physical_device_surface_capabilities(pd, surface)
             .map_err(vk_err("get_physical_device_surface_capabilities"))?;
-        let extent = caps.current_extent;
+        // 交换链图像尺寸用图层尺寸，而不是 current_extent：在 Android 上，当系统给出 90°/270° 的
+        // 变换提示（current_transform）时，current_extent 可能是宽高互换后的值
+        let extent = vk::Extent2D {
+            width: width.clamp(caps.min_image_extent.width, caps.max_image_extent.width),
+            height: height.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
+        };
+        info!(
+            "surface: current_extent={}x{}, current_transform={:?}, using {}x{} + IDENTITY",
+            caps.current_extent.width, caps.current_extent.height, caps.current_transform,
+            extent.width, extent.height
+        );
         // 背景要透明：优先 INHERIT（Android 上由 SurfaceFlinger 按预乘 alpha 混合），其次 PRE_MULTIPLIED
         let composite_alpha = [
             vk::CompositeAlphaFlagsKHR::INHERIT,
@@ -156,7 +167,9 @@ impl Renderer {
                 .image_array_layers(1)
                 .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT) // 在 RenderPass 里当颜色附件
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)     // 只有一个队列族在用
-                .pre_transform(caps.current_transform)
+                // IDENTITY：我们按图层坐标画，旋转（如果需要）交给合成器做。
+                // 如果改用 current_transform，就得自己把画面预先旋转好
+                .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
                 .composite_alpha(composite_alpha)
                 .present_mode(vk::PresentModeKHR::FIFO)             // 等垂直同步；所有驱动都必须支持
                 .clipped(true),

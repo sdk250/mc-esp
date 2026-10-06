@@ -48,7 +48,7 @@ constexpr uint32_t kWindowMagic = ('_' << 24) | ('w' << 16) | ('n' << 8) | 'd';
 
 // 创建图层，返回可以交给 vkCreateAndroidSurfaceKHR 的 ANativeWindow*；失败返回 nullptr，原因打印到 stderr。
 //
-// w、h 是屏幕“自然方向”的尺寸（竖屏手机就是竖屏的宽高），图层坐标系也是这个方向。
+// w、h 是图层的尺寸，单位是“逻辑显示坐标”的像素：这个坐标系跟着屏幕旋转，横屏时宽 > 高。
 extern "C" ANativeWindow* overlay_create(uint32_t w, uint32_t h) {
     void* gui = dlopen("libgui.so", RTLD_NOW);
     void* utils = dlopen("libutils.so", RTLD_NOW);
