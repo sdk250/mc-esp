@@ -3,6 +3,9 @@ use crate::{
     process::{ Process, TAG_MASK, Region }
 };
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use tracing::info;
 
 
@@ -10,22 +13,60 @@ const MODULE: &str = "Game_Module";
 pub const STORAGE_ID: u32 = 0x85B93800;
 pub const ROTATION_ID: u32 = 0x75DF36B7;
 
+#[derive(Debug, Clone)]
 pub struct Actor {
     pub addr: u64,
-    pub rtti: String
+    /// RTTI 类名，例如 "6Animal"。同一个类的所有实体共用一份字符串
+    pub rtti: Arc<str>,
 }
 
-/// 遍历 ActorOwnerComponent 的存储池，返回所有活着的 Actor 地址（跳过墓碑）
+/// vptr → RTTI 类名 的缓存。同一个类的对象 vptr 相同，类名只需要解析一次
+pub type RttiCache = HashMap<u64, Arc<str>>;
+
+/// ActorOwnerComponent 存储池每页的槽位数（每页 1 KB，每个槽是一个 8 字节的 Actor*）
+const SLOTS_PER_PAGE: usize = 128;
+
+/// 遍历 ActorOwnerComponent 的存储池，返回所有活着的 Actor（跳过墓碑）
 ///
-/// TODO: 只读了第 0 页；超过 128 个实体时要按页表继续读
-pub fn list_actors(proc: &Process, entry_addr: u64) -> Result<Vec<Actor>> {
-    let slot_count = (proc.read_ptr(entry_addr + 0x28)? - proc.read_ptr(entry_addr + 0x20)?) / 4;
-    let page0 = proc.read_ptr(proc.read_ptr(entry_addr + 0x50)?)?;
+/// 开销尽量小，可以频繁调用：
+///   - 每一页用一次系统调用整页读出，而不是逐个槽位读；
+///   - 类名按 vptr 缓存，命中时每个实体只需要读 1 次 vptr；
+///   - 单个实体读取失败（比如它恰好在这时被销毁）只跳过它，不影响整个列表。
+pub fn list_actors(proc: &Process, entry_addr: u64, names: &mut RttiCache) -> Result<Vec<Actor>> {
+    let slot_count = ((proc.read_ptr(entry_addr + 0x28)? - proc.read_ptr(entry_addr + 0x20)?) / 4) as usize;
+    let pages_begin = proc.read_ptr(entry_addr + 0x50)?;
+    let page_count = slot_count.div_ceil(SLOTS_PER_PAGE);
+
+    // 页表：一次读出所有页的指针
+    let mut page_table = vec![0u8; page_count * 8];
+    if proc.read_into(pages_begin, &mut page_table) != page_table.len() {
+        return Err(ESPError::NotFullyRead(MODULE, page_table.len(), 0));
+    }
+
     let mut ret = Vec::new();
-    for n in 0..slot_count {
-        let actor_addr = proc.read_ptr(page0 + n * 0x8)?;
-        if actor_addr != 0x0 {
-            ret.push(Actor { addr: actor_addr, rtti: rtti_name(proc, actor_addr)? });
+    let mut page_buf = vec![0u8; SLOTS_PER_PAGE * 8];
+    for (page_index, raw) in page_table.chunks_exact(8).enumerate() {
+        let page = u64::from_le_bytes(raw.try_into().unwrap()) & TAG_MASK;
+        if page == 0 { continue; }
+        // 最后一页可能没满，只读用到的槽位
+        let slots = (slot_count - page_index * SLOTS_PER_PAGE).min(SLOTS_PER_PAGE);
+        let bytes = &mut page_buf[..slots * 8];
+        if proc.read_into(page, bytes) != bytes.len() { continue; }
+
+        for raw in bytes.chunks_exact(8) {
+            let addr = u64::from_le_bytes(raw.try_into().unwrap()) & TAG_MASK;
+            if addr == 0 { continue; }   // 墓碑
+            let Ok(vptr) = proc.read_ptr(addr) else { continue; };
+            let rtti = match names.get(&vptr) {
+                Some(name) => name.clone(),
+                None => {
+                    let Ok(name) = rtti_name(proc, addr) else { continue; };
+                    let name: Arc<str> = name.into();
+                    names.insert(vptr, name.clone());
+                    name
+                }
+            };
+            ret.push(Actor { addr, rtti });
         }
     }
 

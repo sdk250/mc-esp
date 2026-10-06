@@ -5,6 +5,7 @@ mod game;
 mod overlay;
 mod renderer;
 mod projection;
+mod tracker;
 
 
 use tracing::{ error, info };
@@ -14,7 +15,7 @@ use error::{ ESPError, Result };
 
 use process::{ Process };
 use game::{
-    scan_actors, list_actors, fetch_component_addr,
+    scan_actors, fetch_component_addr,
     STORAGE_ID, fetch_rotation_addr
 };
 
@@ -39,6 +40,8 @@ fn _main() -> Result<()> {
     };
     let mut process = Process::new(pid);
     process.init()?;
+    // 渲染循环和实体刷新线程共用同一个 Process（只读，process_vm_readv 本身是线程安全的）
+    let process = std::sync::Arc::new(process);
     info!(
         "Game PID: {}, Base address: 0x{:X}, vptr: 0x{:X}",
         process.pid, process.base, process.base + VPTR_OFFSET
@@ -65,11 +68,15 @@ fn _main() -> Result<()> {
         &process, client_act,
         STORAGE_ID
     )?;
-    let actors = list_actors(&process, entry_addr)?;
+    // 实体列表只由后台线程 actor-tracker 扫描；这里等它的第一份结果，从中找本地玩家
+    let mut actors_rx = tracker::spawn(process.clone(), entry_addr);
+    let mut actors = tracker::wait_first(&mut actors_rx, std::time::Duration::from_secs(3))
+        .ok_or(ESPError::Custom(MODULE, "actor-tracker produced no actor list.".into()))?;
     let player = actors
         .iter()
-        .filter(| v | v.rtti == "11LocalPlayer").next()
-        .ok_or(ESPError::Custom(MODULE, "Local player not found.".into()))?;
+        .find(|v| &*v.rtti == "11LocalPlayer")
+        .ok_or(ESPError::Custom(MODULE, "Local player not found.".into()))?
+        .clone();
     let player_eid = process.read_u32(player.addr + 0x18)?;
     let rotation_addr = fetch_rotation_addr(&process, client_act, player_eid)?;
     let mut buf = [0u8; 8];
@@ -82,15 +89,14 @@ fn _main() -> Result<()> {
     let window = overlay::create_window(overlay::SCREEN_W, overlay::SCREEN_H)?;
     let mut renderer = renderer::Renderer::new(window, overlay::SCREEN_W, overlay::SCREEN_H)?;
 
-    let mut actors = list_actors(&process, entry_addr)?;
     let (mut pitch, mut yaw) = (0.0f32, 0.0f32);
     // 焦距（像素）= 矩阵的 a × 半屏宽。读失败的帧沿用上一帧的值
     let mut k = projection::read_focal(&process, proj_addr).unwrap_or(1.0) * w / 2.0;
     let mut outlines = Vec::new();
-    for frame in 0u64.. {
-        // 实体列表每秒左右刷新一次（rtti_name 要读好几次内存，没必要每帧都做）
-        if frame % 60 == 0 {
-            actors = list_actors(&process, entry_addr)?;
+    loop {
+        // 后台线程有新列表就换上（Arc 克隆，不复制列表本身）
+        if actors_rx.has_changed().unwrap_or(false) {
+            actors = actors_rx.borrow_and_update().clone();
         }
 
         // 读到 (0,0) 视为读写竞争：沿用上一帧的角度，而不是跳过这一帧（跳过会让框闪烁）
@@ -111,8 +117,8 @@ fn _main() -> Result<()> {
         let camera = camera::Camera { pos: player_xyz, pitch, yaw, w, h, k };
 
         outlines.clear();
-        for actor in &actors {
-            if actor.rtti != "6Animal" { continue; }
+        for actor in actors.iter() {
+            // if &*actor.rtti != "6Animal" { continue; }
             let Ok(svc) = process.read_ptr(actor.addr + 0x208) else { continue; };
             let Ok(feet) = process.read_vec3(svc) else { continue; };
             if let Some(rect) = camera.project_box(feet, 1.0, 1.3) {
@@ -127,8 +133,6 @@ fn _main() -> Result<()> {
         // FIFO 模式下 draw 会等到下一次垂直同步，循环自然就按屏幕刷新率运行
         renderer.draw(&outlines)?;
     }
-
-    Ok(())
 }
 
 pub fn logger_service(with_ansi: bool, with_file: bool, with_line_number: bool)
