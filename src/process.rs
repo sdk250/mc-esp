@@ -116,6 +116,43 @@ impl Process {
         n.max(0) as usize
     }
 
+    /// 一次系统调用读取多段不连续的内存，结果按顺序首尾相接写进 `out`
+    ///
+    /// `segments` 是 (地址, 长度) 列表，`out.len()` 必须等于长度之和。返回每一段是否完整读到。
+    /// process_vm_readv 遇到第一段读不了的内存就停下，后面的段都没读；这些段会逐个重试一次，
+    /// 这样某个实体恰好被销毁时，只有它自己那一段失败。
+    pub fn read_many(&self, segments: &[(u64, usize)], out: &mut [u8]) -> Vec<bool> {
+        // 内核单次最多接受 IOV_MAX（1024）个 iovec
+        const IOV_MAX: usize = 1024;
+        debug_assert_eq!(out.len(), segments.iter().map(|s| s.1).sum::<usize>());
+
+        let mut ok = vec![false; segments.len()];
+        let mut offset = 0;
+        for (chunk_index, chunk) in segments.chunks(IOV_MAX).enumerate() {
+            let chunk_len: usize = chunk.iter().map(|s| s.1).sum();
+            let out_chunk = &mut out[offset..offset + chunk_len];
+            let local = libc::iovec { iov_base: out_chunk.as_mut_ptr().cast(), iov_len: chunk_len };
+            let remote: Vec<libc::iovec> = chunk
+                .iter()
+                .map(|&(addr, len)| libc::iovec { iov_base: addr as *mut libc::c_void, iov_len: len })
+                .collect();
+            let n = unsafe {
+                libc::process_vm_readv(self.pid, &local, 1, remote.as_ptr(), remote.len() as _, 0)
+            }.max(0) as usize;
+
+            // 前 n 个字节覆盖到的段是完整的；其余的段单独重试
+            let mut seg_offset = 0;
+            for (i, &(addr, len)) in chunk.iter().enumerate() {
+                let index = chunk_index * IOV_MAX + i;
+                let dst = &mut out_chunk[seg_offset..seg_offset + len];
+                ok[index] = seg_offset + len <= n || self.read_into(addr, dst) == len;
+                seg_offset += len;
+            }
+            offset += chunk_len;
+        }
+        ok
+    }
+
     pub fn read_u64(&self, addr: u64) -> Result<u64> {
         const BIT: usize = 0x8;
         let mut b = [0u8; BIT];

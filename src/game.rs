@@ -18,7 +18,13 @@ pub struct Actor {
     pub addr: u64,
     /// RTTI 类名，例如 "6Animal"。同一个类的所有实体共用一份字符串
     pub rtti: Arc<str>,
+    /// [Actor+0x208]：StateVectorComponent 的地址（+0x00 pos，+0x0C posPrev）。
+    /// 在实体的整个生命周期里不变，所以刷新列表时读一次，渲染时直接用
+    pub state_vector: u64,
 }
+
+/// Actor 里指向 StateVectorComponent 的指针的偏移
+pub const STATE_VECTOR_PTR_OFFSET: u64 = 0x208;
 
 /// vptr → RTTI 类名 的缓存。同一个类的对象 vptr 相同，类名只需要解析一次
 pub type RttiCache = HashMap<u64, Arc<str>>;
@@ -66,7 +72,9 @@ pub fn list_actors(proc: &Process, entry_addr: u64, names: &mut RttiCache) -> Re
                     name
                 }
             };
-            ret.push(Actor { addr, rtti });
+            let Ok(state_vector) = proc.read_ptr(addr + STATE_VECTOR_PTR_OFFSET) else { continue; };
+            if state_vector == 0 { continue; }
+            ret.push(Actor { addr, rtti, state_vector });
         }
     }
 

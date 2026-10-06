@@ -35,6 +35,12 @@ pub struct Outline {
 }
 
 
+/// begin_frame 拿到的交换链图像，交给 end_frame 使用
+pub struct Frame {
+    image_index: u32,
+}
+
+
 /// 把 vk::Result 转成 ESPError 错误类型，`what` 写明是哪一步失败
 fn vk_err(what: &'static str) -> impl Fn(vk::Result) -> ESPError {
     move |r| ESPError::Custom(MODULE, format!("{what}: {r:?}").into())
@@ -66,6 +72,8 @@ pub struct Renderer {
     in_flight: vk::Fence,
     /// 交换链图像尺寸，等于图层尺寸
     pub extent: vk::Extent2D,
+    /// 实际使用的显示模式。MAILBOX 时 begin_frame 不会等垂直同步，调用方要自己控制帧率
+    pub present_mode: vk::PresentModeKHR,
 }
 
 impl Renderer {
@@ -156,6 +164,17 @@ impl Renderer {
             .find(|&a| caps.supported_composite_alpha.contains(a))
             .ok_or(ESPError::Custom(MODULE, "surface does not support transparent composite alpha".into()))?;
 
+        // 显示模式：优先 MAILBOX——总是显示最新画好的一帧，旧帧直接丢弃，不排队。
+        // FIFO 下所有图像要排队依次显示，这台机器的交换链至少 5 张图像，最坏要等 4 帧才轮到最新的画面，
+        // 转动视角时框就会明显拖在后面。没有 MAILBOX 时退回 FIFO（所有驱动都必须支持）
+        let present_mode = surface_fn
+            .get_physical_device_surface_present_modes(pd, surface)
+            .map_err(vk_err("get_physical_device_surface_present_modes"))?
+            .into_iter()
+            .find(|&m| m == vk::PresentModeKHR::MAILBOX)
+            .unwrap_or(vk::PresentModeKHR::FIFO);
+        info!("present mode: {:?}", present_mode);
+
         let swapchain_fn = ash::khr::swapchain::Device::new(&instance, &device);
         let swapchain = swapchain_fn.create_swapchain(
             &vk::SwapchainCreateInfoKHR::default()
@@ -171,7 +190,7 @@ impl Renderer {
                 // 如果改用 current_transform，就得自己把画面预先旋转好
                 .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
                 .composite_alpha(composite_alpha)
-                .present_mode(vk::PresentModeKHR::FIFO)             // 等垂直同步；所有驱动都必须支持
+                .present_mode(present_mode)
                 .clipped(true),
             None,
         ).map_err(vk_err("create_swapchain"))?;
@@ -271,11 +290,22 @@ impl Renderer {
         Ok(Self {
             _entry: entry, instance, surface_fn, surface, device, queue, swapchain_fn, swapchain,
             views, render_pass, framebuffers, pool, cmd, image_ready, render_done, in_flight, extent,
+            present_mode,
         })
     }}
 
-    /// 画一帧：整屏清成透明，再画出所有边框。FIFO 模式下会阻塞到下一次垂直同步
-    pub fn draw(&mut self, outlines: &[Outline]) -> Result<()> { unsafe {
+    /// 画一帧 = begin_frame + end_frame
+    #[allow(dead_code)]
+    pub fn draw(&mut self, outlines: &[Outline]) -> Result<()> {
+        let frame = self.begin_frame()?;
+        self.end_frame(frame, outlines)
+    }
+
+    /// 开始一帧：等上一帧的 GPU 工作结束，再向交换链要一张空闲图像
+    ///
+    /// FIFO 模式下这里可能阻塞到下一次垂直同步。所以要在它**之后**再读游戏内存，
+    /// 提交给 GPU 的才是最新的数据。返回值交给 end_frame
+    pub fn begin_frame(&mut self) -> Result<Frame> { unsafe {
         let d = &self.device;
 
         // ① 等上一帧的 GPU 工作结束，命令缓冲才能重录
@@ -287,6 +317,13 @@ impl Renderer {
             .acquire_next_image(self.swapchain, u64::MAX, self.image_ready, vk::Fence::null())
             .map_err(vk_err("acquire_next_image"))?;
         d.reset_fences(&[self.in_flight]).map_err(vk_err("reset_fences"))?;
+        Ok(Frame { image_index: idx })
+    }}
+
+    /// 结束一帧：整屏清成透明，画出所有边框，提交并显示
+    pub fn end_frame(&mut self, frame: Frame, outlines: &[Outline]) -> Result<()> { unsafe {
+        let d = &self.device;
+        let idx = frame.image_index;
 
         // ③ 录制命令
         d.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())

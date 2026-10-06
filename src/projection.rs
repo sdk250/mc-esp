@@ -20,10 +20,18 @@ const GAME_RENDERER_PROJ_OFFSET: u64 = 0x420;
 const RATIO_TOLERANCE: f32 = 0.03;
 
 
+/// 矩阵开头需要读的字节数（6 个 float）
+pub const HEAD_LEN: usize = 24;
+
 /// 读矩阵开头的 6 个 float；形状是投影矩阵时返回 a（水平方向的 1 / tan(FOV/2)）
 pub fn read_focal(proc: &Process, addr: u64) -> Option<f32> {
-    let mut buf = [0u8; 24];
-    if proc.read_into(addr, &mut buf) != 24 { return None; }
+    let mut buf = [0u8; HEAD_LEN];
+    if proc.read_into(addr, &mut buf) != HEAD_LEN { return None; }
+    focal_from_bytes(&buf)
+}
+
+/// 从已经读出来的矩阵开头 24 字节里解析 a；形状不对时返回 None
+pub fn focal_from_bytes(buf: &[u8]) -> Option<f32> {
     let f: [f32; 6] = std::array::from_fn(|i| f32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap()));
     let (a, b) = (f[0], f[5]);
     let aspect = overlay::SCREEN_W as f32 / overlay::SCREEN_H as f32;
