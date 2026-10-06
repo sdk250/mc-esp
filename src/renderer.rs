@@ -4,6 +4,9 @@
 //! 在 RenderPass 里用 vkCmdClearAttachments 把这些区域直接“清”成框的颜色。
 //!
 //! 坐标系是图层的坐标系：屏幕自然方向（竖屏），原点在左上角，x 向右、y 向下，单位像素。
+//!
+//! 有必要说明一下，这部分代码是由 Anthropic 公司的 AI 模型 Claude5.5编写的，我并不具备 Rust 图形开发的经验
+//! 更别提这是完全基于底层 Vulkan API 进行渲染，其中有非常多的图形接口的学习成本都是非常高的
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
