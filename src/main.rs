@@ -2,6 +2,8 @@ mod process;
 mod error;
 mod camera;
 mod game;
+mod overlay;
+mod renderer;
 
 
 use tracing::{ error, info };
