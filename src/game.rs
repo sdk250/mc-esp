@@ -12,6 +12,8 @@ use tracing::info;
 const MODULE: &str = "Game_Module";
 pub const STORAGE_ID: u32 = 0x85B93800;
 pub const ROTATION_ID: u32 = 0x75DF36B7;
+/// LocalPlayer（RTTI 11LocalPlayer）的 vtable 相对基址的偏移。只对当前游戏版本有效
+pub const LOCAL_PLAYER_VPTR_OFFSET: u64 = 0x12D08F98;
 
 #[derive(Debug, Clone)]
 pub struct Actor {

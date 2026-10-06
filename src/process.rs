@@ -87,6 +87,7 @@ pub struct Process {
     pub regions: Vec<Region>
 }
 
+#[allow(dead_code)]
 impl Process {
     pub fn new(pid: i32) -> Self {
         Self { pid, base: 0x0, regions: Vec::new() }

@@ -60,3 +60,46 @@ impl Vsync {
         }
     }
 }
+
+
+/// 渲染循环的节奏控制：每帧开始前调用一次 `wait`
+///
+/// - MAILBOX：begin_frame 不等垂直同步，优先跟着 AChoreographer 走，拿不到时按固定帧率 sleep；
+/// - FIFO：begin_frame 本身就会等垂直同步，这里什么都不做。
+pub struct Pacer {
+    vsync: Option<Vsync>,
+    sleep_interval: Option<std::time::Duration>,
+    next_frame: std::time::Instant,
+}
+
+impl Pacer {
+    pub fn new(mailbox: bool, fallback_fps: f64) -> Self {
+        let vsync = if mailbox { Vsync::new() } else { None };
+        let sleep_interval = (mailbox && vsync.is_none()).then(|| std::time::Duration::from_secs_f64(1.0 / fallback_fps));
+        Self { vsync, sleep_interval, next_frame: std::time::Instant::now() }
+    }
+
+    pub fn describe(&self) -> &'static str {
+        match (&self.vsync, self.sleep_interval) {
+            (Some(_), _) => "MAILBOX + AChoreographer vsync",
+            (None, Some(_)) => "MAILBOX + fixed-rate sleep",
+            (None, None) => "FIFO (driver)",
+        }
+    }
+
+    /// 平均每帧的时长，给 tick 计时估计检测延迟用
+    pub fn frame_interval(&self) -> std::time::Duration {
+        self.sleep_interval.unwrap_or(std::time::Duration::from_secs_f64(1.0 / 120.0))
+    }
+
+    pub fn wait(&mut self) {
+        if let Some(v) = self.vsync.as_mut() {
+            v.wait();
+        } else if let Some(interval) = self.sleep_interval {
+            let now = std::time::Instant::now();
+            if self.next_frame > now { std::thread::sleep(self.next_frame - now); }
+            // 落后太多（比如被系统挂起过）时不追帧，从现在重新开始计时
+            self.next_frame = (self.next_frame + interval).max(std::time::Instant::now());
+        }
+    }
+}
