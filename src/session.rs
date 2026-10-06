@@ -14,6 +14,7 @@ use crate::camera;
 use crate::error::{ ESPError, Result };
 use crate::game::{ self, Actor, LOCAL_PLAYER_VPTR_OFFSET, STORAGE_ID };
 use crate::interp;
+use crate::kinds::{ self, Kind };
 use crate::overlay;
 use crate::process::Process;
 use crate::projection;
@@ -55,7 +56,10 @@ impl Session {
             .ok_or(ESPError::Custom(MODULE, format!("no usable LocalPlayer among {} candidates", candidates.len()).into()))?;
 
         // 实体列表只由后台线程 actor-tracker 扫描；等它的第一份结果，从中确认本地玩家
-        let mut actors_rx = tracker::spawn(process.clone(), entry_addr);
+        // 碰撞箱组件的存储池：找不到也不致命，框退回默认尺寸
+        let aabb_storage = game::fetch_component_addr(&process, player_addr, game::AABB_SHAPE_ID).ok();
+        if aabb_storage.is_none() { tracing::warn!("AABBShapeComponent not found, using default box size"); }
+        let mut actors_rx = tracker::spawn(process.clone(), entry_addr, aabb_storage);
         let actors = tracker::wait_first(&mut actors_rx, Duration::from_secs(3))
             .ok_or(ESPError::Custom(MODULE, "actor-tracker produced no actor list".into()))?;
         let player = actors
@@ -68,6 +72,9 @@ impl Session {
         let rotation_addr = game::fetch_rotation_addr(&process, player.addr, player_eid)?;
         // GameRenderer 不一定跟着世界重建，但每次进入世界重新定位一次最稳妥
         let proj_addr = projection::locate(&process)?;
+        for a in actors.iter() {
+            info!("  actor 0x{:X}: {} / {:?} ({}) {:.2}x{:.2} foot {:.2}", a.addr, a.type_name, a.kind, a.rtti, a.size[0], a.size[1], a.foot_offset);
+        }
         info!(
             "Session started: PID {}, base 0x{:X}, LocalPlayer 0x{:X} (EID {}), {} actors, projection 0x{:X}",
             process.pid, process.base, player.addr, player_eid, actors.len(), proj_addr
@@ -178,14 +185,17 @@ impl Session {
 
                 for (i, actor) in self.actors.iter().enumerate() {
                     if !ok[FIRST_ACTOR_SEG + i] || actor.addr == self.player.addr { continue; }
+                    if actor.kind == Kind::Ignored { continue; }
                     let off = ACTORS_OFF + i * STATE_LEN;
-                    let feet = interp::lerp(vec3_at(off + 12), vec3_at(off), alpha);
+                    let mut feet = interp::lerp(vec3_at(off + 12), vec3_at(off), alpha);
+                    feet[1] -= actor.foot_offset;
                     if feet.iter().any(|v| !v.is_finite()) { continue; }
-                    if let Some(rect) = camera.project_box(feet, 1.0, 1.3) {
+                    if let Some(rect) = camera.project_box(feet, actor.size[0], actor.size[1]) {
                         outlines.push(Outline {
                             rect,
-                            color: [1.0, 0.0, 0.0, 1.0],
+                            color: kinds::color(actor.kind),
                             thickness: 2.0,
+                            fill: kinds::fill(actor.kind),
                         });
                     }
                 }
@@ -196,3 +206,4 @@ impl Session {
         }
     }
 }
+

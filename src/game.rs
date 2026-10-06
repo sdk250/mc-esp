@@ -1,4 +1,5 @@
 use crate::{
+    kinds::{ self, Kind },
     error::{ ESPError, Result },
     process::{ Process, TAG_MASK, Region }
 };
@@ -12,6 +13,8 @@ use tracing::info;
 const MODULE: &str = "Game_Module";
 pub const STORAGE_ID: u32 = 0x85B93800;
 pub const ROTATION_ID: u32 = 0x75DF36B7;
+/// FNV1a32("AABBShapeComponent")：碰撞箱组件
+pub const AABB_SHAPE_ID: u32 = 0xBAC1B3CF;
 /// LocalPlayer（RTTI 11LocalPlayer）的 vtable 相对基址的偏移。只对当前游戏版本有效
 pub const LOCAL_PLAYER_VPTR_OFFSET: u64 = 0x12D08F98;
 
@@ -20,6 +23,15 @@ pub struct Actor {
     pub addr: u64,
     /// RTTI 类名，例如 "6Animal"。同一个类的所有实体共用一份字符串
     pub rtti: Arc<str>,
+    /// 实体类型名，例如 "minecraft:cow"；读不到时为空串
+    pub type_name: Arc<str>,
+    /// 按类型名得到的分类，决定框的颜色、画不画
+    pub kind: Kind,
+    /// 碰撞箱的宽、高（格），来自 AABBShapeComponent；读不到时用 DEFAULT_SIZE
+    pub size: [f32; 2],
+    /// StateVector 的 pos 比碰撞箱底部高多少。生物的 pos 在脚底（≈0），玩家的 pos 在眼睛（≈1.62），
+    /// 画框时用 pos.y - foot_offset 当作脚底
+    pub foot_offset: f32,
     /// [Actor+0x208]：StateVectorComponent 的地址（+0x00 pos，+0x0C posPrev）。
     /// 在实体的整个生命周期里不变，所以刷新列表时读一次，渲染时直接用
     pub state_vector: u64,
@@ -28,11 +40,98 @@ pub struct Actor {
 /// Actor 里指向 StateVectorComponent 的指针的偏移
 pub const STATE_VECTOR_PTR_OFFSET: u64 = 0x208;
 
-/// vptr → RTTI 类名 的缓存。同一个类的对象 vptr 相同，类名只需要解析一次
-pub type RttiCache = HashMap<u64, Arc<str>>;
+/// Actor 里实体类型名（HashedString：u64 哈希 + std::string）的偏移
+const TYPE_NAME_OFFSET: u64 = 0x228;
 
-/// ActorOwnerComponent 存储池每页的槽位数（每页 1 KB，每个槽是一个 8 字节的 Actor*）
+/// 名字缓存：同一个类的对象 vptr 相同、同一种实体的类型名哈希相同，名字都只需要解析一次
+#[derive(Default)]
+pub struct NameCache {
+    /// vptr → RTTI 类名
+    rtti: HashMap<u64, Arc<str>>,
+    /// 类型名哈希 → 类型名
+    types: HashMap<u64, Arc<str>>,
+}
+
+/// 读 Actor +0x228 的 HashedString，返回类型名（例如 "minecraft:cow"）
+///
+/// 布局：+0x00 u64 哈希，+0x08 std::string（NDK libc++，24 字节）：
+///   - 短字符串（≤ 22 字节）：第 0 字节最低位为 0，长度 = 第 0 字节 >> 1，字符紧跟其后；
+///   - 长字符串：第 0 个 u64 最低位为 1（容量），+0x08 长度，+0x10 指向字符的指针。
+fn read_type_name(proc: &Process, actor: u64, cache: &mut HashMap<u64, Arc<str>>) -> Option<Arc<str>> {
+    let mut b = [0u8; 32];
+    if proc.read_into(actor + TYPE_NAME_OFFSET, &mut b) != b.len() { return None; }
+    let hash = u64::from_le_bytes(b[..8].try_into().unwrap());
+    if hash == 0 { return None; }
+    if let Some(name) = cache.get(&hash) { return Some(name.clone()); }
+
+    let s = &b[8..];
+    let bytes = if s[0] & 1 == 0 {
+        let len = (s[0] >> 1) as usize;
+        if len > 22 { return None; }
+        s[1..1 + len].to_vec()
+    } else {
+        let len = u64::from_le_bytes(s[8..16].try_into().unwrap()) as usize;
+        let ptr = u64::from_le_bytes(s[16..24].try_into().unwrap()) & TAG_MASK;
+        if len == 0 || len > 128 { return None; }
+        let mut buf = vec![0u8; len];
+        if proc.read_into(ptr, &mut buf) != len { return None; }
+        buf
+    };
+    let name: Arc<str> = String::from_utf8(bytes).ok()?.into();
+    cache.insert(hash, name.clone());
+    Some(name)
+}
+
+/// 组件存储池每页的槽位数。这个游戏把 EnTT 的页大小配置成了 128 个元素：
+/// ActorOwnerComponent（8 字节）一页 1 KB，AABBShapeComponent（32 字节）一页 4 KB
 const SLOTS_PER_PAGE: usize = 128;
+
+/// AABBShapeComponent 的布局（32 字节）：min(xyz) max(xyz) 宽 高，全是 f32
+const AABB_SHAPE_SIZE: u64 = 0x20;
+/// 读不到碰撞箱时用的尺寸（玩家大小）
+pub const DEFAULT_SIZE: [f32; 2] = [0.6, 1.8];
+
+/// Actor 里 EntityId 的偏移（EntityContext：+0x08 EntityRegistry、+0x10 entt registry、+0x18 EntityId）
+const ENTITY_ID_OFFSET: u64 = 0x18;
+
+/// 某个组件存储池的一份快照：EntityId → 槽位下标，以及每一页的地址。按 EntityId 找这个实体的那一份组件
+struct ComponentIndex {
+    slots: HashMap<u32, usize>,
+    pages: Vec<u64>,
+}
+
+impl ComponentIndex {
+    /// 读存储池的 packed 数组（[S+0x20..S+0x28]，每个元素是 u32 EntityId）和页表（[S+0x50..S+0x58]）
+    fn read(proc: &Process, storage: u64) -> Result<Self> {
+        let read_vec = |begin_off: u64, elem: usize| -> Result<Vec<u8>> {
+            let begin = proc.read_ptr(storage + begin_off)?;
+            let end = proc.read_ptr(storage + begin_off + 8)?;
+            let len = (end.saturating_sub(begin) as usize / elem) * elem;
+            let mut buf = vec![0u8; len];
+            if proc.read_into(begin, &mut buf) != len {
+                return Err(ESPError::NotFullyRead(MODULE, len, 0));
+            }
+            Ok(buf)
+        };
+        let slots = read_vec(0x20, 4)?
+            .chunks_exact(4)
+            .enumerate()
+            .map(|(i, c)| (u32::from_le_bytes(c.try_into().unwrap()), i))
+            .collect();
+        let pages = read_vec(0x50, 8)?
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()) & TAG_MASK)
+            .collect();
+        Ok(Self { slots, pages })
+    }
+
+    /// 这个实体的那一份组件的地址；元素大小为 `elem_size` 字节
+    fn element(&self, eid: u32, elem_size: u64) -> Option<u64> {
+        let i = *self.slots.get(&eid)?;
+        let page = *self.pages.get(i / SLOTS_PER_PAGE)?;
+        (page != 0).then(|| page + (i % SLOTS_PER_PAGE) as u64 * elem_size)
+    }
+}
 
 /// 遍历 ActorOwnerComponent 的存储池，返回所有活着的 Actor（跳过墓碑）
 ///
@@ -40,7 +139,10 @@ const SLOTS_PER_PAGE: usize = 128;
 ///   - 每一页用一次系统调用整页读出，而不是逐个槽位读；
 ///   - 类名按 vptr 缓存，命中时每个实体只需要读 1 次 vptr；
 ///   - 单个实体读取失败（比如它恰好在这时被销毁）只跳过它，不影响整个列表。
-pub fn list_actors(proc: &Process, entry_addr: u64, names: &mut RttiCache) -> Result<Vec<Actor>> {
+///
+/// `aabb_storage` 是 AABBShapeComponent 的存储池，用来读每个实体的碰撞箱尺寸；为 None 时一律用 DEFAULT_SIZE
+pub fn list_actors(proc: &Process, entry_addr: u64, aabb_storage: Option<u64>, names: &mut NameCache) -> Result<Vec<Actor>> {
+    let aabb = aabb_storage.and_then(|s| ComponentIndex::read(proc, s).ok());
     let slot_count = ((proc.read_ptr(entry_addr + 0x28)? - proc.read_ptr(entry_addr + 0x20)?) / 4) as usize;
     let pages_begin = proc.read_ptr(entry_addr + 0x50)?;
     let page_count = slot_count.div_ceil(SLOTS_PER_PAGE);
@@ -65,18 +167,34 @@ pub fn list_actors(proc: &Process, entry_addr: u64, names: &mut RttiCache) -> Re
             let addr = u64::from_le_bytes(raw.try_into().unwrap()) & TAG_MASK;
             if addr == 0 { continue; }   // 墓碑
             let Ok(vptr) = proc.read_ptr(addr) else { continue; };
-            let rtti = match names.get(&vptr) {
+            let rtti = match names.rtti.get(&vptr) {
                 Some(name) => name.clone(),
                 None => {
                     let Ok(name) = rtti_name(proc, addr) else { continue; };
                     let name: Arc<str> = name.into();
-                    names.insert(vptr, name.clone());
+                    names.rtti.insert(vptr, name.clone());
                     name
                 }
             };
+            let type_name = read_type_name(proc, addr, &mut names.types).unwrap_or_else(|| "".into());
+            let kind = kinds::classify(&type_name);
             let Ok(state_vector) = proc.read_ptr(addr + STATE_VECTOR_PTR_OFFSET) else { continue; };
             if state_vector == 0 { continue; }
-            ret.push(Actor { addr, rtti, state_vector });
+            // 碰撞箱：min(xyz) max(xyz) 宽 高。宽高决定框的大小；pos.y - min.y 是 pos 到脚底的高度差
+            let shape = aabb.as_ref().and_then(|index| {
+                let eid = proc.read_u32(addr + ENTITY_ID_OFFSET).ok()?;
+                let elem = index.element(eid, AABB_SHAPE_SIZE)?;
+                let mut b = [0u8; AABB_SHAPE_SIZE as usize];
+                if proc.read_into(elem, &mut b) != b.len() { return None; }
+                let f = |i: usize| f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+                let pos_y = proc.read_f32(state_vector + 4).ok()?;
+                Some(([f(6), f(7)], pos_y - f(1)))
+            });
+            // 数值必须合理，否则多半是读到了别的东西，退回默认值
+            let (size, foot_offset) = shape
+                .filter(|([w, h], off)| (0.05..=20.0).contains(w) && (0.05..=20.0).contains(h) && (-0.5..=3.0).contains(off))
+                .unwrap_or((DEFAULT_SIZE, 0.0));
+            ret.push(Actor { addr, rtti, type_name, kind, size, foot_offset, state_vector });
         }
     }
 

@@ -9,6 +9,7 @@ mod tracker;
 mod interp;
 mod vsync;
 mod session;
+mod kinds;
 
 
 use std::sync::Arc;

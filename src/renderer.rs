@@ -32,6 +32,8 @@ pub struct Outline {
     pub color: [f32; 4],
     /// 线宽（像素）
     pub thickness: f32,
+    /// 框内的填充色（非预乘 RGBA），None 表示不填充。想要半透明就把 alpha 设小一点
+    pub fill: Option<[f32; 4]>,
 }
 
 
@@ -376,6 +378,16 @@ impl Renderer {
     unsafe fn record_outline(&self, o: &Outline) {
         let [l, t, r, b] = o.rect;
         let th = o.thickness.max(1.0);
+
+        // 先填充框内，再画边框，边框才不会被填充色盖住。
+        // 注意 vkCmdClearAttachments 是直接写入像素、不做混合：重叠的框后画的会覆盖先画的，
+        // 而不是两层半透明叠加变深。框之间很少重叠，这个差别基本看不出来
+        if let Some(fill) = o.fill {
+            if let Some(inner) = self.clip(l + th, t + th, r - th, b - th) {
+                unsafe { self.device.cmd_clear_attachments(self.cmd, &[Self::clear_color(fill)], &[inner]); }
+            }
+        }
+
         let edges = [
             (l, t, r, t + th),      // 上
             (l, b - th, r, b),      // 下
@@ -388,16 +400,16 @@ impl Renderer {
             .collect();
         if rects.is_empty() { return; }
 
-        // 图层按预乘 alpha 混合，所以 RGB 要先乘以 alpha
-        let [cr, cg, cb, ca] = o.color;
-        let attachment = [vk::ClearAttachment {
+        unsafe { self.device.cmd_clear_attachments(self.cmd, &[Self::clear_color(o.color)], &rects); }
+    }
+
+    /// 非预乘 RGBA → 清除到第 0 个颜色附件的参数。图层按预乘 alpha 混合，所以 RGB 要先乘以 alpha
+    fn clear_color([r, g, b, a]: [f32; 4]) -> vk::ClearAttachment {
+        vk::ClearAttachment {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             color_attachment: 0,
-            clear_value: vk::ClearValue {
-                color: vk::ClearColorValue { float32: [cr * ca, cg * ca, cb * ca, ca] },
-            },
-        }];
-        unsafe { self.device.cmd_clear_attachments(self.cmd, &attachment, &rects); }
+            clear_value: vk::ClearValue { color: vk::ClearColorValue { float32: [r * a, g * a, b * a, a] } },
+        }
     }
 
     /// 浮点矩形 → 整数像素矩形，并裁剪到屏幕范围内
