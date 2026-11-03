@@ -95,6 +95,12 @@ impl Session {
         let view_delay = Duration::from_millis(
             std::env::var("MC_ESP_VIEW_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_VIEW_DELAY_MS),
         );
+        // MC_ESP_BOX=0 / off / false 时不画方框（名字标签和骨架照常画）
+        let draw_box = !matches!(
+            std::env::var("MC_ESP_BOX").ok().as_deref().map(str::to_ascii_lowercase).as_deref(),
+            Some("0" | "off" | "false")
+        );
+        info!("box: {}", if draw_box { "on" } else { "off (MC_ESP_BOX)" });
         let mut view = interp::ViewHistory::new();
         let mut clock = interp::TickClock::new(pacer.frame_interval());
         let (mut pitch, mut yaw) = (0.0f32, 0.0f32);
@@ -217,7 +223,9 @@ impl Session {
                     if feet.iter().any(|v| !v.is_finite()) { continue; }
                     let color = kinds::color(actor.kind);
                     if let Some(rect) = camera.project_box(feet, actor.size[0], actor.size[1]) {
-                        shapes.push(Shape::Rect { rect, color, thickness: 2.0, fill: kinds::fill(actor.kind) });
+                        if draw_box {
+                            shapes.push(Shape::Rect { rect, color, thickness: 2.0, fill: kinds::fill(actor.kind) });
+                        }
                         // 框的正上方：名字 + 距离（从眼睛到脚底，米）
                         let dist = (0..3).map(|j| (feet[j] - eye[j]).powi(2)).sum::<f32>().sqrt();
                         shapes.push(Shape::Text {

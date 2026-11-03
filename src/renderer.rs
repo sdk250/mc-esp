@@ -38,7 +38,8 @@ pub enum Shape {
     Rect { rect: [f32; 4], color: [f32; 4], thickness: f32, fill: Option<[f32; 4]> },
     /// 线段
     Line { from: [f32; 2], to: [f32; 2], color: [f32; 4], thickness: f32 },
-    /// 空心圆
+    /// 空心圆（骨架现在不用，留作通用图形）
+    #[allow(dead_code)]
     Circle { center: [f32; 2], radius: f32, color: [f32; 4], thickness: f32 },
     /// 文字，`anchor` 是文字底边的中点（方便放在框的正上方）。带一圈黑色描边，任何背景上都看得清
     Text { anchor: [f32; 2], text: String, color: [f32; 4] },
