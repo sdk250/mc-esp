@@ -113,3 +113,10 @@ impl ViewHistory {
         Some((last_p, last_y))
     }
 }
+
+/// 游戏的角度约定下的单位方向向量：yaw 0 = 面朝 +Z、-90 = 面朝 +X；pitch 抬头为负（度）
+pub fn direction(yaw: f32, pitch: f32) -> [f32; 3] {
+    let (sy, cy) = yaw.to_radians().sin_cos();
+    let (sp, cp) = pitch.to_radians().sin_cos();
+    [-sy * cp, -sp, cy * cp]
+}

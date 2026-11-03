@@ -15,8 +15,12 @@ pub const STORAGE_ID: u32 = 0x85B93800;
 pub const ROTATION_ID: u32 = 0x75DF36B7;
 /// FNV1a32("AABBShapeComponent")：碰撞箱组件
 pub const AABB_SHAPE_ID: u32 = 0xBAC1B3CF;
+/// FNV1a32("MobBodyRotationComponent")：身体朝向，8 字节 (yBodyRot, yBodyRotO)
+pub const BODY_ROTATION_ID: u32 = 0xD7F64BBA;
+/// FNV1a32("ActorHeadRotationComponent")：头部朝向，8 字节 (yHeadRot, yHeadRotO)
+pub const HEAD_ROTATION_ID: u32 = 0xBABE7211;
 /// LocalPlayer（RTTI 11LocalPlayer）的 vtable 相对基址的偏移。只对当前游戏版本有效
-pub const LOCAL_PLAYER_VPTR_OFFSET: u64 = 0x12D08F98;
+pub const LOCAL_PLAYER_VPTR_OFFSET: u64 = 0x139F6EA0;
 
 #[derive(Debug, Clone)]
 pub struct Actor {
@@ -32,16 +36,43 @@ pub struct Actor {
     /// StateVector 的 pos 比碰撞箱底部高多少。生物的 pos 在脚底（≈0），玩家的 pos 在眼睛（≈1.62），
     /// 画框时用 pos.y - foot_offset 当作脚底
     pub foot_offset: f32,
-    /// [Actor+0x208]：StateVectorComponent 的地址（+0x00 pos，+0x0C posPrev）。
+    /// [Actor+0x228]：StateVectorComponent 的地址（+0x00 pos，+0x0C posPrev）。
     /// 在实体的整个生命周期里不变，所以刷新列表时读一次，渲染时直接用
     pub state_vector: u64,
+    /// 这个实体的 ActorRotationComponent（16 字节：pitch, yaw, prevPitch, prevYaw）
+    pub rotation: Option<u64>,
+    /// MobBodyRotationComponent（8 字节）。只有生物有
+    pub body_rotation: Option<u64>,
+    /// ActorHeadRotationComponent（8 字节）。只有生物有
+    pub head_rotation: Option<u64>,
+}
+
+/// 各个组件存储池的地址。全部从本地玩家所在的 registry 里按组件名的哈希找到；找不到的为 None
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Pools {
+    pub aabb: Option<u64>,
+    pub rotation: Option<u64>,
+    pub body_rotation: Option<u64>,
+    pub head_rotation: Option<u64>,
+}
+
+impl Pools {
+    pub fn find(proc: &Process, actor_addr: u64) -> Self {
+        let get = |id| fetch_component_addr(proc, actor_addr, id).ok();
+        Self {
+            aabb: get(AABB_SHAPE_ID),
+            rotation: get(ROTATION_ID),
+            body_rotation: get(BODY_ROTATION_ID),
+            head_rotation: get(HEAD_ROTATION_ID),
+        }
+    }
 }
 
 /// Actor 里指向 StateVectorComponent 的指针的偏移
-pub const STATE_VECTOR_PTR_OFFSET: u64 = 0x208;
+pub const STATE_VECTOR_PTR_OFFSET: u64 = 0x228;
 
 /// Actor 里实体类型名（HashedString：u64 哈希 + std::string）的偏移
-const TYPE_NAME_OFFSET: u64 = 0x228;
+const TYPE_NAME_OFFSET: u64 = 0x240;
 
 /// 名字缓存：同一个类的对象 vptr 相同、同一种实体的类型名哈希相同，名字都只需要解析一次
 #[derive(Default)]
@@ -52,7 +83,7 @@ pub struct NameCache {
     types: HashMap<u64, Arc<str>>,
 }
 
-/// 读 Actor +0x228 的 HashedString，返回类型名（例如 "minecraft:cow"）
+/// 读 Actor +0x240 的 HashedString，返回类型名（例如 "minecraft:cow"）
 ///
 /// 布局：+0x00 u64 哈希，+0x08 std::string（NDK libc++，24 字节）：
 ///   - 短字符串（≤ 22 字节）：第 0 字节最低位为 0，长度 = 第 0 字节 >> 1，字符紧跟其后；
@@ -140,9 +171,13 @@ impl ComponentIndex {
 ///   - 类名按 vptr 缓存，命中时每个实体只需要读 1 次 vptr；
 ///   - 单个实体读取失败（比如它恰好在这时被销毁）只跳过它，不影响整个列表。
 ///
-/// `aabb_storage` 是 AABBShapeComponent 的存储池，用来读每个实体的碰撞箱尺寸；为 None 时一律用 DEFAULT_SIZE
-pub fn list_actors(proc: &Process, entry_addr: u64, aabb_storage: Option<u64>, names: &mut NameCache) -> Result<Vec<Actor>> {
-    let aabb = aabb_storage.and_then(|s| ComponentIndex::read(proc, s).ok());
+/// `pools` 里的存储池用来定位每个实体的碰撞箱和朝向组件。碰撞箱找不到时一律用 DEFAULT_SIZE
+pub fn list_actors(proc: &Process, entry_addr: u64, pools: &Pools, names: &mut NameCache) -> Result<Vec<Actor>> {
+    let index = |pool: Option<u64>| pool.and_then(|s| ComponentIndex::read(proc, s).ok());
+    let aabb = index(pools.aabb);
+    let rotation = index(pools.rotation);
+    let body_rotation = index(pools.body_rotation);
+    let head_rotation = index(pools.head_rotation);
     let slot_count = ((proc.read_ptr(entry_addr + 0x28)? - proc.read_ptr(entry_addr + 0x20)?) / 4) as usize;
     let pages_begin = proc.read_ptr(entry_addr + 0x50)?;
     let page_count = slot_count.div_ceil(SLOTS_PER_PAGE);
@@ -181,9 +216,9 @@ pub fn list_actors(proc: &Process, entry_addr: u64, aabb_storage: Option<u64>, n
             let Ok(state_vector) = proc.read_ptr(addr + STATE_VECTOR_PTR_OFFSET) else { continue; };
             if state_vector == 0 { continue; }
             // 碰撞箱：min(xyz) max(xyz) 宽 高。宽高决定框的大小；pos.y - min.y 是 pos 到脚底的高度差
-            let shape = aabb.as_ref().and_then(|index| {
-                let eid = proc.read_u32(addr + ENTITY_ID_OFFSET).ok()?;
-                let elem = index.element(eid, AABB_SHAPE_SIZE)?;
+            let eid = proc.read_u32(addr + ENTITY_ID_OFFSET).ok();
+            let element = |index: &Option<ComponentIndex>, size| index.as_ref().and_then(|i| i.element(eid?, size));
+            let shape = element(&aabb, AABB_SHAPE_SIZE).and_then(|elem| {
                 let mut b = [0u8; AABB_SHAPE_SIZE as usize];
                 if proc.read_into(elem, &mut b) != b.len() { return None; }
                 let f = |i: usize| f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
@@ -194,7 +229,12 @@ pub fn list_actors(proc: &Process, entry_addr: u64, aabb_storage: Option<u64>, n
             let (size, foot_offset) = shape
                 .filter(|([w, h], off)| (0.05..=20.0).contains(w) && (0.05..=20.0).contains(h) && (-0.5..=3.0).contains(off))
                 .unwrap_or((DEFAULT_SIZE, 0.0));
-            ret.push(Actor { addr, rtti, type_name, kind, size, foot_offset, state_vector });
+            ret.push(Actor {
+                addr, rtti, type_name, kind, size, foot_offset, state_vector,
+                rotation: element(&rotation, 16),
+                body_rotation: element(&body_rotation, 8),
+                head_rotation: element(&head_rotation, 8),
+            });
         }
     }
 
@@ -326,4 +366,50 @@ pub fn scan_actors(proc: &Process, vptr: u64) -> Result<Vec<u64>> {
     }
 
     Ok(found)
+}
+
+/// 逆向用：骨骼透视可能用到的组件，按名字的 FNV1a32 找存储池
+pub const PROBE_COMPONENTS: &[(&str, u32)] = &[
+    ("ActorRotationComponent", ROTATION_ID),
+    ("MobBodyRotationComponent", 0xD7F64BBA),
+    ("ActorHeadRotationComponent", 0xBABE7211),
+    ("ActorWalkAnimationComponent", 0x666777C6),
+];
+
+/// 逆向用：打印每个候选组件的存储池，以及第 0 页开头的原始数据（按 f32 显示），用来推断元素大小和字段布局
+///
+/// 同时打印第 0 页前几个槽位属于哪个实体，方便把数据和实体对上号
+pub fn probe_components(proc: &Process, actor_addr: u64, actors: &[Actor]) {
+    // EntityId → 类型名
+    let names: HashMap<u32, &str> = actors
+        .iter()
+        .filter_map(|a| Some((proc.read_u32(a.addr + ENTITY_ID_OFFSET).ok()?, &*a.type_name)))
+        .collect();
+    for &(name, id) in PROBE_COMPONENTS {
+        let Ok(storage) = fetch_component_addr(proc, actor_addr, id) else {
+            tracing::info!("[probe] {name} (0x{id:08X}): not found");
+            continue;
+        };
+        let Ok(index) = ComponentIndex::read(proc, storage) else {
+            tracing::info!("[probe] {name}: storage 0x{storage:X} unreadable");
+            continue;
+        };
+        let page0 = index.pages.first().copied().unwrap_or(0);
+        tracing::info!("[probe] {name} (0x{id:08X}): storage 0x{storage:X}, {} slots, page0 0x{page0:X}", index.slots.len());
+        let mut by_slot: Vec<(usize, u32)> = index.slots.iter().map(|(&e, &i)| (i, e)).collect();
+        by_slot.sort();
+        for &(i, eid) in by_slot.iter().take(6) {
+            tracing::info!("[probe]   slot {i}: eid {eid} {}", names.get(&eid).copied().unwrap_or("?"));
+        }
+        if page0 == 0 { continue; }
+        let mut buf = [0u8; 0xC0];
+        if proc.read_into(page0, &mut buf) != buf.len() { continue; }
+        for (row, chunk) in buf.chunks_exact(16).enumerate() {
+            let f: Vec<String> = chunk
+                .chunks_exact(4)
+                .map(|c| format!("{:>10.3}", f32::from_le_bytes(c.try_into().unwrap())))
+                .collect();
+            tracing::info!("[probe]   +0x{:02X}: {}", row * 16, f.join(" "));
+        }
+    }
 }

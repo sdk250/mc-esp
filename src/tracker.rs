@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::warn;
 
-use crate::game::{ self, Actor, NameCache };
+use crate::game::{ self, Actor, NameCache, Pools };
 use crate::process::Process;
 
 
@@ -22,14 +22,14 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 ///
 /// 通道的初始值是空列表；需要第一份真实数据时，用 `wait_first` 等待。
 /// 渲染循环退出（接收端被丢弃）后，线程在下一次发送时发现没人接收，自行结束。
-pub fn spawn(process: Arc<Process>, entry_addr: u64, aabb_storage: Option<u64>) -> watch::Receiver<Arc<Vec<Actor>>> {
+pub fn spawn(process: Arc<Process>, entry_addr: u64, pools: Pools) -> watch::Receiver<Arc<Vec<Actor>>> {
     let (tx, rx) = watch::channel(Arc::new(Vec::new()));
     thread::Builder::new()
         .name("actor-tracker".into())
         .spawn(move || {
             let mut names = NameCache::default();
             loop {
-                match game::list_actors(&process, entry_addr, aabb_storage, &mut names) {
+                match game::list_actors(&process, entry_addr, &pools, &mut names) {
                     Ok(actors) => {
                         if tx.send(Arc::new(actors)).is_err() { break; }
                     }

@@ -10,6 +10,7 @@ mod interp;
 mod vsync;
 mod session;
 mod kinds;
+mod skeleton;
 
 
 use std::sync::Arc;

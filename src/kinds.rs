@@ -1,6 +1,6 @@
 //! 实体类型 → 分类 → 框的颜色
 //!
-//! 类型名来自客户端 Actor +0x228 的 HashedString（例如 "minecraft:cow"），见 game::read_type_name
+//! 类型名来自客户端 Actor +0x240 的 HashedString（例如 "minecraft:cow"），见 game::read_type_name
 
 /// 实体分类
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,4 +66,10 @@ pub fn fill(kind: Kind) -> Option<[f32; 4]> {
         Kind::Hostile => Some([1.0, 0.2, 0.2, 0.15]),
         _ => None,
     }
+}
+
+/// 标签上显示的短名字：去掉 "minecraft:" 前缀，玩家的皮肤信息也去掉
+pub fn short_name(type_name: &str) -> &str {
+    let name = type_name.strip_prefix("minecraft:").unwrap_or(type_name);
+    if name.starts_with("player.") { "player" } else { name }
 }

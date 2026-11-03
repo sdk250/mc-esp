@@ -1,7 +1,9 @@
-//! Vulkan 渲染器：把一组矩形边框画到覆盖图层上
+//! Vulkan 渲染器：把一组图形（框、线、文字）画到覆盖图层上
 //!
-//! 不用 shader 和图形管线：每个框拆成上、下、左、右四条实心细长矩形，
-//! 在 RenderPass 里用 vkCmdClearAttachments 把这些区域直接“清”成框的颜色。
+//! Vulkan 部分（实例、交换链、RenderPass、同步）自己管理；真正的绘制交给 Dear ImGui：
+//! 每帧把 `Shape` 列表写进 ImGui 的背景绘制列表，再由 imgui-rs-vulkan-renderer
+//! 用它自带的图形管线（shader + 顶点缓冲 + 字体纹理）录进我们的命令缓冲。
+//! 不创建任何 ImGui 窗口，也不处理输入，只把它当作 2D 绘图库用。
 //!
 //! 坐标系是图层的坐标系：逻辑显示坐标（横屏时就是游戏画面的坐标），原点在左上角，x 向右、y 向下，单位像素。
 //!
@@ -23,17 +25,23 @@ const MODULE: &str = "Renderer";
 const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 
 
-/// 一个矩形边框
-#[derive(Debug, Clone, Copy)]
-pub struct Outline {
-    /// 左、上、右、下（像素，图层坐标系）
-    pub rect: [f32; 4],
-    /// 非预乘的 RGBA，各分量 0.0..=1.0。预乘由渲染器完成
-    pub color: [f32; 4],
-    /// 线宽（像素）
-    pub thickness: f32,
-    /// 框内的填充色（非预乘 RGBA），None 表示不填充。想要半透明就把 alpha 设小一点
-    pub fill: Option<[f32; 4]>,
+/// 字号（像素）。屏幕是 3120x1440，ImGui 默认的 13 像素太小
+const FONT_SIZE: f32 = 36.0;
+/// 优先使用系统字体，找不到时退回 ImGui 内置的 ProggyClean（只有 ASCII）
+const FONT_PATH: &str = "/system/fonts/Roboto-Regular.ttf";
+
+
+/// 一个要画的图形。坐标都是图层坐标系的像素；颜色都是非预乘的 RGBA，各分量 0.0..=1.0
+#[derive(Debug, Clone)]
+pub enum Shape {
+    /// 矩形边框。rect = 左、上、右、下；fill 为框内的填充色，None 表示不填充
+    Rect { rect: [f32; 4], color: [f32; 4], thickness: f32, fill: Option<[f32; 4]> },
+    /// 线段
+    Line { from: [f32; 2], to: [f32; 2], color: [f32; 4], thickness: f32 },
+    /// 空心圆
+    Circle { center: [f32; 2], radius: f32, color: [f32; 4], thickness: f32 },
+    /// 文字，`anchor` 是文字底边的中点（方便放在框的正上方）。带一圈黑色描边，任何背景上都看得清
+    Text { anchor: [f32; 2], text: String, color: [f32; 4] },
 }
 
 
@@ -72,6 +80,12 @@ pub struct Renderer {
     render_done: Vec<vk::Semaphore>,
     /// GPU 执行完本帧命令时触发，CPU 等它之后才能重录命令缓冲
     in_flight: vk::Fence,
+    /// ImGui 上下文：保存字体图集，每帧生成绘制数据
+    imgui: imgui::Context,
+    /// ImGui 的 Vulkan 后端。必须在 device 之前销毁，所以用 Option，在 Drop 里手动 take
+    gui: Option<imgui_rs_vulkan_renderer::Renderer>,
+    /// 上一帧的时间，算 ImGui 要求的 delta_time
+    last_frame: std::time::Instant,
     /// 交换链图像尺寸，等于图层尺寸
     pub extent: vk::Extent2D,
     /// 实际使用的显示模式。MAILBOX 时 begin_frame 不会等垂直同步，调用方要自己控制帧率
@@ -289,18 +303,43 @@ impl Renderer {
             None,
         ).map_err(vk_err("create_fence"))?;
 
+        // ---- ImGui：上下文 + 字体，然后创建 Vulkan 后端（它会在这里把字体图集上传成纹理） ----
+        let mut imgui = imgui::Context::create();
+        imgui.set_ini_filename(None);   // 不要在当前目录写 imgui.ini
+        imgui.io_mut().display_size = [extent.width as f32, extent.height as f32];
+        imgui.io_mut().display_framebuffer_scale = [1.0, 1.0];
+        match std::fs::read(FONT_PATH) {
+            Ok(data) => {
+                // 字体图集要在构建纹理时读这块内存，干脆让它活到进程结束
+                let data: &'static [u8] = Box::leak(data.into_boxed_slice());
+                imgui.fonts().add_font(&[imgui::FontSource::TtfData { data, size_pixels: FONT_SIZE, config: None }]);
+            }
+            Err(e) => {
+                tracing::warn!("cannot read {FONT_PATH} ({e}), using the built-in font");
+                imgui.fonts().add_font(&[imgui::FontSource::DefaultFontData {
+                    config: Some(imgui::FontConfig { size_pixels: FONT_SIZE, ..Default::default() }),
+                }]);
+            }
+        }
+        // in_flight_frames = 1：我们只有一个命令缓冲和一个 fence，每帧开始前都等上一帧做完，
+        // 所以顶点缓冲也只需要一份
+        let gui = imgui_rs_vulkan_renderer::Renderer::with_default_allocator(
+            &instance, pd, device.clone(), queue, pool, render_pass, &mut imgui,
+            Some(imgui_rs_vulkan_renderer::Options { in_flight_frames: 1, ..Default::default() }),
+        ).map_err(|e| ESPError::Custom(MODULE, format!("create imgui renderer: {e}").into()))?;
+
         Ok(Self {
             _entry: entry, instance, surface_fn, surface, device, queue, swapchain_fn, swapchain,
-            views, render_pass, framebuffers, pool, cmd, image_ready, render_done, in_flight, extent,
-            present_mode,
+            views, render_pass, framebuffers, pool, cmd, image_ready, render_done, in_flight,
+            imgui, gui: Some(gui), last_frame: std::time::Instant::now(), extent, present_mode,
         })
     }}
 
     /// 画一帧 = begin_frame + end_frame
     #[allow(dead_code)]
-    pub fn draw(&mut self, outlines: &[Outline]) -> Result<()> {
+    pub fn draw(&mut self, shapes: &[Shape]) -> Result<()> {
         let frame = self.begin_frame()?;
-        self.end_frame(frame, outlines)
+        self.end_frame(frame, shapes)
     }
 
     /// 开始一帧：等上一帧的 GPU 工作结束，再向交换链要一张空闲图像
@@ -322,10 +361,24 @@ impl Renderer {
         Ok(Frame { image_index: idx })
     }}
 
-    /// 结束一帧：整屏清成透明，画出所有边框，提交并显示
-    pub fn end_frame(&mut self, frame: Frame, outlines: &[Outline]) -> Result<()> { unsafe {
-        let d = &self.device;
+    /// 结束一帧：整屏清成透明，画出所有图形，提交并显示
+    pub fn end_frame(&mut self, frame: Frame, shapes: &[Shape]) -> Result<()> { unsafe {
         let idx = frame.image_index;
+
+        // ImGui 生成本帧的顶点数据（纯 CPU 工作）
+        let now = std::time::Instant::now();
+        self.imgui.io_mut().delta_time = (now - self.last_frame).as_secs_f32().max(1e-4);
+        self.last_frame = now;
+        {
+            let ui = self.imgui.new_frame();
+            let list = ui.get_background_draw_list();
+            for shape in shapes {
+                record_shape(ui, &list, shape);
+            }
+        }
+        let draw_data = self.imgui.render();
+
+        let d = &self.device;
 
         // ③ 录制命令
         d.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty())
@@ -343,8 +396,9 @@ impl Renderer {
                 .clear_values(&transparent),
             vk::SubpassContents::INLINE,
         );
-        for outline in outlines {
-            self.record_outline(outline);
+        if let Some(gui) = self.gui.as_mut() {
+            gui.cmd_draw(self.cmd, draw_data)
+                .map_err(|e| ESPError::Custom(MODULE, format!("imgui cmd_draw: {e}").into()))?;
         }
         d.cmd_end_render_pass(self.cmd);
         d.end_command_buffer(self.cmd).map_err(vk_err("end_command_buffer"))?;
@@ -373,64 +427,36 @@ impl Renderer {
         ).map_err(vk_err("queue_present"))?;
         Ok(())
     }}
+}
 
-    /// 把一个边框拆成四条实心矩形，录制一条 vkCmdClearAttachments
-    unsafe fn record_outline(&self, o: &Outline) {
-        let [l, t, r, b] = o.rect;
-        let th = o.thickness.max(1.0);
-
-        // 先填充框内，再画边框，边框才不会被填充色盖住。
-        // 注意 vkCmdClearAttachments 是直接写入像素、不做混合：重叠的框后画的会覆盖先画的，
-        // 而不是两层半透明叠加变深。框之间很少重叠，这个差别基本看不出来
-        if let Some(fill) = o.fill {
-            if let Some(inner) = self.clip(l + th, t + th, r - th, b - th) {
-                unsafe { self.device.cmd_clear_attachments(self.cmd, &[Self::clear_color(fill)], &[inner]); }
+/// 把一个图形写进 ImGui 的绘制列表
+///
+/// ImGui 的混合方式是 src×α + dst×(1−α)、alpha 通道 α + dst×(1−α)。从全透明的背景开始画，
+/// 结果正好就是预乘 alpha 的像素，和图层的合成方式（INHERIT = 预乘）一致；半透明图形重叠时也能正确叠加
+fn record_shape(ui: &imgui::Ui, list: &imgui::DrawListMut, shape: &Shape) {
+    match shape {
+        Shape::Rect { rect: [l, t, r, b], color, thickness, fill } => {
+            if let Some(fill) = fill {
+                list.add_rect([*l, *t], [*r, *b], *fill).filled(true).build();
             }
+            list.add_rect([*l, *t], [*r, *b], *color).thickness(*thickness).build();
         }
-
-        let edges = [
-            (l, t, r, t + th),      // 上
-            (l, b - th, r, b),      // 下
-            (l, t, l + th, b),      // 左
-            (r - th, t, r, b),      // 右
-        ];
-        let rects: Vec<vk::ClearRect> = edges
-            .iter()
-            .filter_map(|&(x0, y0, x1, y1)| self.clip(x0, y0, x1, y1))
-            .collect();
-        if rects.is_empty() { return; }
-
-        unsafe { self.device.cmd_clear_attachments(self.cmd, &[Self::clear_color(o.color)], &rects); }
-    }
-
-    /// 非预乘 RGBA → 清除到第 0 个颜色附件的参数。图层按预乘 alpha 混合，所以 RGB 要先乘以 alpha
-    fn clear_color([r, g, b, a]: [f32; 4]) -> vk::ClearAttachment {
-        vk::ClearAttachment {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            color_attachment: 0,
-            clear_value: vk::ClearValue { color: vk::ClearColorValue { float32: [r * a, g * a, b * a, a] } },
+        Shape::Line { from, to, color, thickness } => {
+            list.add_line(*from, *to, *color).thickness(*thickness).build();
         }
-    }
-
-    /// 浮点矩形 → 整数像素矩形，并裁剪到屏幕范围内
-    ///
-    /// vkCmdClearAttachments 要求每个矩形都完全落在 render area 里，超出屏幕的部分必须先裁掉；
-    /// 完全在屏幕外或者宽高为 0 时返回 None
-    fn clip(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> Option<vk::ClearRect> {
-        let (w, h) = (self.extent.width as f32, self.extent.height as f32);
-        let x0 = x0.floor().clamp(0.0, w);
-        let y0 = y0.floor().clamp(0.0, h);
-        let x1 = x1.ceil().clamp(0.0, w);
-        let y1 = y1.ceil().clamp(0.0, h);
-        if x1 <= x0 || y1 <= y0 { return None; }
-        Some(vk::ClearRect {
-            rect: vk::Rect2D {
-                offset: vk::Offset2D { x: x0 as i32, y: y0 as i32 },
-                extent: vk::Extent2D { width: (x1 - x0) as u32, height: (y1 - y0) as u32 },
-            },
-            base_array_layer: 0,
-            layer_count: 1,
-        })
+        Shape::Circle { center, radius, color, thickness } => {
+            list.add_circle(*center, *radius, *color).thickness(*thickness).build();
+        }
+        Shape::Text { anchor, text, color } => {
+            let [tw, th] = ui.calc_text_size(text);
+            let (x, y) = (anchor[0] - tw / 2.0, anchor[1] - th);
+            // 描边：先在周围 4 个方向各画一遍黑色，再画正文
+            let shadow = [0.0, 0.0, 0.0, color[3]];
+            for (dx, dy) in [(-2.0, 0.0), (2.0, 0.0), (0.0, -2.0), (0.0, 2.0)] {
+                list.add_text([x + dx, y + dy], shadow, text);
+            }
+            list.add_text([x, y], *color, text);
+        }
     }
 }
 
@@ -439,6 +465,8 @@ impl Drop for Renderer {
         unsafe {
             // 先等 GPU 把手上的活干完，否则销毁正在使用的对象是未定义行为
             let _ = self.device.device_wait_idle();
+            // ImGui 后端持有 device 的克隆，要在 device 销毁之前释放它的缓冲、纹理和管线
+            drop(self.gui.take());
             let d = &self.device;
             d.destroy_fence(self.in_flight, None);
             for &s in &self.render_done { d.destroy_semaphore(s, None); }

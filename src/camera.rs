@@ -1,6 +1,6 @@
 /// 第一人称相机：位置 + 朝向 + 屏幕参数
 pub struct Camera {
-    pub pos: [f32; 3], // 眼睛坐标，就是 [LP+0x208]
+    pub pos: [f32; 3], // 眼睛坐标，就是 [LP+0x228]
     pub pitch: f32,    // 度，抬头为负
     pub yaw: f32,      // 度，0 = 面朝 +Z，-90 = 面朝 +X
     pub w: f32,        // 屏幕宽（像素）
