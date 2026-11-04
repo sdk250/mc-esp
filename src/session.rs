@@ -32,6 +32,28 @@ const DEFAULT_VIEW_DELAY_MS: u64 = 30;
 const LOST_FRAMES_LIMIT: u32 = 30;
 
 
+/// 方框的样式，由环境变量 MC_ESP_BOX 决定
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoxMode {
+    /// 0 / off / false：不画方框（名字标签和骨架照常画）
+    Off,
+    /// 2d：屏幕上的矩形
+    Flat,
+    /// 其他值或不设置：3D 方框
+    Solid,
+}
+
+impl BoxMode {
+    fn from_env() -> Self {
+        match std::env::var("MC_ESP_BOX").unwrap_or_default().to_ascii_lowercase().as_str() {
+            "0" | "off" | "false" => Self::Off,
+            "2d" => Self::Flat,
+            _ => Self::Solid,
+        }
+    }
+}
+
+
 pub struct Session {
     process: Arc<Process>,
     player: Actor,
@@ -95,12 +117,14 @@ impl Session {
         let view_delay = Duration::from_millis(
             std::env::var("MC_ESP_VIEW_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_VIEW_DELAY_MS),
         );
-        // MC_ESP_BOX=0 / off / false 时不画方框（名字标签和骨架照常画）
-        let draw_box = !matches!(
-            std::env::var("MC_ESP_BOX").ok().as_deref().map(str::to_ascii_lowercase).as_deref(),
-            Some("0" | "off" | "false")
+        let box_mode = BoxMode::from_env();
+        info!("box: {box_mode:?} (MC_ESP_BOX)");
+        // MC_ESP_SKELETON=1 / on / true 时画骨架；默认只画视线
+        let bones = matches!(
+            std::env::var("MC_ESP_SKELETON").unwrap_or_default().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true"
         );
-        info!("box: {}", if draw_box { "on" } else { "off (MC_ESP_BOX)" });
+        info!("skeleton: {} (MC_ESP_SKELETON)", if bones { "on" } else { "off, gaze only" });
         let mut view = interp::ViewHistory::new();
         let mut clock = interp::TickClock::new(pacer.frame_interval());
         let (mut pitch, mut yaw) = (0.0f32, 0.0f32);
@@ -222,9 +246,25 @@ impl Session {
                     feet[1] -= actor.foot_offset;
                     if feet.iter().any(|v| !v.is_finite()) { continue; }
                     let color = kinds::color(actor.kind);
+                    let fill = kinds::fill(actor.kind);
+                    // 体型和朝向：只有认识体型、而且朝向组件都读到了的生物才有
+                    let angle = |o: usize| f32_at(off + o);
+                    let have = |o: usize, addr: Option<u64>| addr.is_some() && ok[seg + o];
+                    let body = skeleton::body_of(kinds::short_name(&actor.type_name))
+                        .filter(|_| have(2, actor.body_rotation) && have(3, actor.head_rotation));
+                    let body_yaw = interp::lerp_angle(angle(A_BODY + 4), angle(A_BODY), alpha);
+
+                    if box_mode == BoxMode::Solid {
+                        // 认识体型的跟着身体转、罩住整个模型；其他实体就是不会转的碰撞箱
+                        let (yaw, extents) = match body {
+                            Some(body) => (body_yaw, skeleton::Extents::of_body(body, actor.size)),
+                            None => (0.0, skeleton::Extents::of_hitbox(actor.size)),
+                        };
+                        skeleton::draw_box(feet, yaw, extents, &camera, color, 2.0, fill, &mut shapes);
+                    }
                     if let Some(rect) = camera.project_box(feet, actor.size[0], actor.size[1]) {
-                        if draw_box {
-                            shapes.push(Shape::Rect { rect, color, thickness: 2.0, fill: kinds::fill(actor.kind) });
+                        if box_mode == BoxMode::Flat {
+                            shapes.push(Shape::Rect { rect, color, thickness: 2.0, fill });
                         }
                         // 框的正上方：名字 + 距离（从眼睛到脚底，米）
                         let dist = (0..3).map(|j| (feet[j] - eye[j]).powi(2)).sum::<f32>().sqrt();
@@ -235,11 +275,7 @@ impl Session {
                         });
                     }
 
-                    // 骨架：只给认识体型、而且朝向组件都读到了的生物画
-                    let body = skeleton::body_of(kinds::short_name(&actor.type_name));
-                    let have = |o: usize, addr: Option<u64>| addr.is_some() && ok[seg + o];
-                    if let Some(body) = body.filter(|_| have(2, actor.body_rotation) && have(3, actor.head_rotation)) {
-                        let angle = |o: usize| f32_at(off + o);
+                    if let Some(body) = body {
                         // 两个组件都是 (当前, 上一 tick)；ActorRotation 是 (pitch, yaw, prevPitch, prevYaw)
                         let (pitch, prev_pitch) = if have(1, actor.rotation) {
                             (angle(A_ROT), angle(A_ROT + 8))
@@ -252,12 +288,12 @@ impl Session {
                             body,
                             feet,
                             size: actor.size,
-                            body_yaw: interp::lerp_angle(angle(A_BODY + 4), angle(A_BODY), alpha),
+                            body_yaw,
                             head_yaw: interp::lerp_angle(angle(A_HEAD + 4), angle(A_HEAD), alpha),
                             head_pitch: prev_pitch + (pitch - prev_pitch) * alpha,
                             step: (cur[0] - prev[0]).hypot(cur[2] - prev[2]),
                         };
-                        skeleton::draw(&pose, &mut walks, ticks, &camera, color, 3.0, &mut shapes);
+                        skeleton::draw(&pose, bones, &mut walks, ticks, &camera, color, 3.0, &mut shapes);
                     }
                 }
             }

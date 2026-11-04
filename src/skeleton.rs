@@ -75,6 +75,104 @@ pub fn body_of(short_name: &str) -> Option<Body> {
 }
 
 
+/// 3D 方框的范围（格），都是从脚底中心量起的距离。
+///
+/// 碰撞箱比模型小：牛的碰撞箱宽 0.9，身子却长 1.1 多，头还要再往前伸。所以方框跟着身体转，并按骨架的尺寸放大，才能把生物罩住
+#[derive(Debug, Clone, Copy)]
+pub struct Extents {
+    /// 左右各多宽
+    pub half_x: f32,
+    /// 向后多长
+    pub back: f32,
+    /// 向前多长
+    pub front: f32,
+    /// 高度
+    pub height: f32,
+}
+
+impl Extents {
+    /// 不知道体型时：就是碰撞箱
+    pub fn of_hitbox([w, h]: [f32; 2]) -> Self {
+        Self { half_x: w / 2.0, back: w / 2.0, front: w / 2.0, height: h }
+    }
+
+    /// 按骨架的尺寸算出来的范围，和下面 `draw` 里的几何保持一致
+    pub fn of_body(body: Body, size: [f32; 2]) -> Self {
+        let [w, h] = size;
+        let hit = w / 2.0;
+        match body {
+            Body::Humanoid | Body::Zombie => {
+                // 手臂的外缘在 ±7 像素，四肢也在这个范围里前后摆；僵尸平举的手臂向前伸到约 12 像素
+                let u = h / 32.0;
+                let side = hit.max(7.0 * u);
+                let front = if body == Body::Zombie { side.max(12.0 * u) } else { side };
+                Self { half_x: side, back: side, front, height: h }
+            }
+            Body::Quadruped(q) => {
+                // 身长的一半，往前再加上脖子和头
+                let half = w * q.half_len;
+                Self { half_x: hit, back: hit.max(half), front: hit.max(half + w * 0.1 + h * 0.27), height: h }
+            }
+            Body::Bird => Self { half_x: hit, back: hit, front: hit.max(w * 0.4 + h * 0.1), height: h },
+        }
+    }
+}
+
+/// 画一个绕竖直轴转过 `yaw` 度的 3D 方框：12 条边，有 `fill` 时再给朝向相机的面上色
+///
+/// 凸多面体朝向相机的面不会互相遮挡（最多 3 个），所以半透明填充不会叠深。
+/// 面的 4 个角里有一个到了身后就不填这个面；边则会裁到近平面上，贴近时仍然画得出来
+pub fn draw_box(
+    feet: [f32; 3],
+    yaw: f32,
+    e: Extents,
+    camera: &Camera,
+    color: [f32; 4],
+    thickness: f32,
+    fill: Option<[f32; 4]>,
+    out: &mut Vec<Shape>,
+) {
+    let fwd = direction(yaw, 0.0);
+    let frame = Frame { origin: feet, right: [-fwd[2], 0.0, fwd[0]], up: [0.0, 1.0, 0.0], fwd };
+    // 角的编号：第 0 位 = 右，第 1 位 = 上，第 2 位 = 前
+    let corners: [[f32; 3]; 8] = std::array::from_fn(|i| frame.at([
+        if i & 1 != 0 { e.half_x } else { -e.half_x },
+        if i & 2 != 0 { e.height } else { 0.0 },
+        if i & 4 != 0 { e.front } else { -e.back },
+    ]));
+
+    if let Some(fill) = fill {
+        const FACES: [[usize; 4]; 6] = [
+            [0, 2, 6, 4], [1, 3, 7, 5],   // 左、右
+            [0, 1, 5, 4], [2, 3, 7, 6],   // 下、上
+            [0, 1, 3, 2], [4, 5, 7, 6],   // 后、前
+        ];
+        let center: [f32; 3] = std::array::from_fn(|i| (corners[0][i] + corners[7][i]) / 2.0);
+        for face in FACES {
+            let face_center: [f32; 3] = std::array::from_fn(|i| face.iter().map(|&c| corners[c][i]).sum::<f32>() / 4.0);
+            // 外法线 = 方框中心 → 面中心；视线和它方向相反，这个面才朝向相机
+            let facing: f32 = (0..3).map(|i| (face_center[i] - camera.pos[i]) * (face_center[i] - center[i])).sum();
+            if facing >= 0.0 { continue; }
+            let projected = face.map(|c| camera.world_to_screen(corners[c]));
+            if projected.iter().all(Option::is_some) {
+                let points = projected.map(|p| { let (x, y) = p.unwrap(); [x, y] });
+                out.push(Shape::Quad { points, color: fill });
+            }
+        }
+    }
+
+    // 只差一位的两个角之间有一条边
+    for i in 0..8 {
+        for bit in [1, 2, 4] {
+            if i & bit != 0 { continue; }
+            if let Some((from, to)) = camera.project_segment(corners[i], corners[i | bit]) {
+                out.push(Shape::Line { from, to, color, thickness });
+            }
+        }
+    }
+}
+
+
 /// 每个实体的走路动画状态（跨帧保存）
 #[derive(Debug, Clone, Copy, Default)]
 struct Walk {
@@ -115,6 +213,8 @@ const EYE_RAISE: f32 = 0.4;
 const GAZE_LEN: f32 = 4.5;
 /// 视线的颜色（橙色），所有实体统一，不跟随框的颜色
 const GAZE_COLOR: [f32; 4] = [1.0, 0.55, 0.0, 1.0];
+/// 视线的粗细（像素）
+const GAZE_THICKNESS: f32 = 5.0;
 
 /// 画一副骨架需要的全部输入（都已经插值好）
 pub struct Pose {
@@ -150,9 +250,12 @@ fn swing(pivot: [f32; 3], len: f32, theta: f32) -> [f32; 3] {
     [pivot[0], pivot[1] - len * theta.cos(), pivot[2] + len * theta.sin()]
 }
 
-/// 生成一副骨架的线段和头部圆圈，追加到 `out`
+/// 生成视线，`bones` 为 true 时连骨架的线段一起，追加到 `out`
+///
+/// 关掉骨架时几何照样要算：视线的起点取决于脖子和头的位置
 pub fn draw(
     pose: &Pose,
+    bones: bool,
     walks: &mut WalkTracker,
     ticks: f32,
     camera: &Camera,
@@ -271,8 +374,9 @@ pub fn draw(
         gazes.push((eye, gaze));
     }
 
-    let gazes = gazes.into_iter().map(|g| (g, GAZE_COLOR));
-    for ((a, b), color) in segs.into_iter().map(|g| (g, color)).chain(gazes) {
+    if !bones { segs.clear(); }
+    let gazes = gazes.into_iter().map(|g| (g, GAZE_COLOR, GAZE_THICKNESS));
+    for ((a, b), color, thickness) in segs.into_iter().map(|g| (g, color, thickness)).chain(gazes) {
         if let (Some(p), Some(q)) = (camera.world_to_screen(a), camera.world_to_screen(b)) {
             out.push(Shape::Line { from: [p.0, p.1], to: [q.0, q.1], color, thickness });
         }

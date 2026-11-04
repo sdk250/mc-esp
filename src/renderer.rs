@@ -38,6 +38,8 @@ pub enum Shape {
     Rect { rect: [f32; 4], color: [f32; 4], thickness: f32, fill: Option<[f32; 4]> },
     /// 线段
     Line { from: [f32; 2], to: [f32; 2], color: [f32; 4], thickness: f32 },
+    /// 实心的凸四边形，用来给 3D 方框的面上色
+    Quad { points: [[f32; 2]; 4], color: [f32; 4] },
     /// 空心圆（骨架现在不用，留作通用图形）
     #[allow(dead_code)]
     Circle { center: [f32; 2], radius: f32, color: [f32; 4], thickness: f32 },
@@ -444,6 +446,16 @@ fn record_shape(ui: &imgui::Ui, list: &imgui::DrawListMut, shape: &Shape) {
         }
         Shape::Line { from, to, color, thickness } => {
             list.add_line(*from, *to, *color).thickness(*thickness).build();
+        }
+        Shape::Quad { points, color } => {
+            // ImGui 的抗锯齿填充要求顶点按顺时针排列；屏幕 y 向下，顺时针时这个和为正
+            let area: f32 = (0..4).map(|i| {
+                let (a, b) = (points[i], points[(i + 1) % 4]);
+                a[0] * b[1] - b[0] * a[1]
+            }).sum();
+            let mut points = points.to_vec();
+            if area < 0.0 { points.reverse(); }
+            list.add_polyline(points, *color).filled(true).build();
         }
         Shape::Circle { center, radius, color, thickness } => {
             list.add_circle(*center, *radius, *color).thickness(*thickness).build();
