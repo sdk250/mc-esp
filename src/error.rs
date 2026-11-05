@@ -19,6 +19,9 @@ pub enum ESPError {
     #[error("{0}: Not fully read: dst={1}, cur={2}")]
     NotFullyRead(&'static str, usize, usize),
 
+    #[error("{0}")]
+    Overlay(#[from] android_overlay::Error),
+
     #[error("An error occurred in {0}: {1}")]
     Custom(&'static str, Arc<str>)
 }

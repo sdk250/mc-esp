@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::{ Duration, Instant };
 
+use android_overlay::{ Overlay, Shape };
 use tokio::sync::watch;
 use tracing::info;
 
@@ -15,13 +16,10 @@ use crate::error::{ ESPError, Result };
 use crate::game::{ self, Actor, LOCAL_PLAYER_VPTR_OFFSET, STORAGE_ID };
 use crate::interp;
 use crate::kinds::{ self, Kind };
-use crate::overlay;
 use crate::process::Process;
 use crate::projection;
-use crate::renderer::{ Renderer, Shape };
 use crate::skeleton;
 use crate::tracker;
-use crate::vsync::Pacer;
 
 
 const MODULE: &str = "Session";
@@ -60,6 +58,8 @@ pub struct Session {
     player_vptr: u64,
     rotation_addr: u64,
     proj_addr: u64,
+    /// 屏幕宽高比，校验投影矩阵的形状时用
+    aspect: f32,
     actors_rx: watch::Receiver<Arc<Vec<Actor>>>,
     actors: Arc<Vec<Actor>>,
 }
@@ -68,7 +68,7 @@ impl Session {
     /// 尝试进入会话：在堆里找本地玩家，再由它找到 registry、实体列表、旋转组件和投影矩阵
     ///
     /// 不在世界里（主菜单、加载中）时返回错误，调用方过一会儿再试。
-    pub fn start(process: Arc<Process>) -> Result<Self> {
+    pub fn start(process: Arc<Process>, aspect: f32) -> Result<Self> {
         // 本地玩家：只要进了世界就一定存在，而且它本身就是客户端的 Actor，可以直接通向客户端 registry。
         // 堆里可能残留着已销毁对象的旧数据，所以每个候选都要能完整走通 registry 才算数
         let player_vptr = process.base + LOCAL_PLAYER_VPTR_OFFSET;
@@ -95,7 +95,7 @@ impl Session {
         let player_eid = process.read_u32(player.addr + 0x18)?;
         let rotation_addr = game::fetch_rotation_addr(&process, player.addr, player_eid)?;
         // GameRenderer 不一定跟着世界重建，但每次进入世界重新定位一次最稳妥
-        let proj_addr = projection::locate(&process)?;
+        let proj_addr = projection::locate(&process, aspect)?;
         for a in actors.iter() {
             info!("  actor 0x{:X}: {} / {:?} ({}) {:.2}x{:.2} foot {:.2}", a.addr, a.type_name, a.kind, a.rtti, a.size[0], a.size[1], a.foot_offset);
         }
@@ -107,12 +107,13 @@ impl Session {
             process.pid, process.base, player.addr, player_eid, actors.len(), proj_addr
         );
 
-        Ok(Self { process, player, player_vptr, rotation_addr, proj_addr, actors_rx, actors })
+        Ok(Self { process, player, player_vptr, rotation_addr, proj_addr, aspect, actors_rx, actors })
     }
 
     /// 每帧画框，直到检测到世界卸载才返回（Ok）。渲染出错时返回 Err
-    pub fn run(&mut self, renderer: &mut Renderer, pacer: &mut Pacer) -> Result<()> {
-        let (w, h) = (overlay::SCREEN_W as f32, overlay::SCREEN_H as f32);
+    pub fn run(&mut self, overlay: &mut Overlay) -> Result<()> {
+        let (w, h) = overlay.size();
+        let (w, h) = (w as f32, h as f32);
         // 视角取多久以前的值，用来抵消游戏自身的渲染延迟（见 interp::ViewHistory）。MC_ESP_VIEW_DELAY_MS 可以调
         let view_delay = Duration::from_millis(
             std::env::var("MC_ESP_VIEW_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_VIEW_DELAY_MS),
@@ -126,10 +127,10 @@ impl Session {
         );
         info!("skeleton: {} (MC_ESP_SKELETON)", if bones { "on" } else { "off, gaze only" });
         let mut view = interp::ViewHistory::new();
-        let mut clock = interp::TickClock::new(pacer.frame_interval());
+        let mut clock = interp::TickClock::new(overlay.frame_interval());
         let (mut pitch, mut yaw) = (0.0f32, 0.0f32);
         // 焦距（像素）= 矩阵的 a × 半屏宽。读失败的帧沿用上一帧的值
-        let mut k = projection::read_focal(&self.process, self.proj_addr).unwrap_or(1.0) * w / 2.0;
+        let mut k = projection::read_focal(&self.process, self.proj_addr, self.aspect).unwrap_or(1.0) * w / 2.0;
         let mut shapes: Vec<Shape> = Vec::new();
         // 每帧一次性读回的内存段：(地址, 长度)，以及接收它们的缓冲区
         let mut segments: Vec<(u64, usize)> = Vec::new();
@@ -140,7 +141,8 @@ impl Session {
         let mut last_frame = Instant::now();
 
         loop {
-            pacer.wait();
+            // 先拿到交换链图像，再读内存：begin_frame 要等垂直同步，等完再读，数据才是最新的
+            let frame = overlay.begin_frame()?;
 
             // 后台线程有新列表就换上（Arc 克隆，不复制列表本身）
             if self.actors_rx.has_changed().unwrap_or(false) {
@@ -148,9 +150,6 @@ impl Session {
                 let actors = &self.actors;
                 walks.retain(|addr| actors.iter().any(|a| a.addr == addr));
             }
-
-            // 先拿到交换链图像，再读内存：FIFO 下 begin_frame 可能要等垂直同步，等完再读，数据才是最新的
-            let frame = renderer.begin_frame()?;
 
             // ---- 一次系统调用读回本帧要用的所有数据 ----
             // 段 0：本地玩家的 vptr（检测世界是否还在）；段 1：玩家的旋转 (pitch, yaw, prevPitch, prevYaw)；
@@ -196,7 +195,7 @@ impl Session {
             lost_frames = if alive { 0 } else { lost_frames + 1 };
             if lost_frames >= LOST_FRAMES_LIMIT {
                 // 交一帧空画面，免得最后一帧的框一直留在屏幕上
-                renderer.end_frame(frame, &[])?;
+                overlay.end_frame(frame, &[])?;
                 info!("LocalPlayer gone, session ended");
                 return Ok(());
             }
@@ -211,7 +210,7 @@ impl Session {
             }
             // FOV 随奔跑、飞行变化，所以焦距每帧都读
             if ok[3] {
-                if let Some(focal) = projection::focal_from_bytes(&bytes[PROJ_OFF..PROJ_OFF + projection::HEAD_LEN]) {
+                if let Some(focal) = projection::focal_from_bytes(&bytes[PROJ_OFF..PROJ_OFF + projection::HEAD_LEN], self.aspect) {
                     k = focal * w / 2.0;
                 }
             }
@@ -299,7 +298,7 @@ impl Session {
             }
 
             // 不管本帧有没有读到数据都要 end_frame：acquire 到的图像必须 present 回去，否则交换链会被耗尽
-            renderer.end_frame(frame, &shapes)?;
+            overlay.end_frame(frame, &shapes)?;
         }
     }
 }

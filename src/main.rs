@@ -2,12 +2,9 @@ mod process;
 mod error;
 mod camera;
 mod game;
-mod overlay;
-mod renderer;
 mod projection;
 mod tracker;
 mod interp;
-mod vsync;
 mod session;
 mod kinds;
 mod skeleton;
@@ -44,13 +41,12 @@ fn main() {
 /// 整体流程：
 ///   等待游戏进程 → 等待进入世界 → 画框，直到退出世界 → 回到“等待进入世界”
 ///
-/// 图层和渲染器不依赖游戏，启动时建一次，一直用到程序结束；
+/// 覆盖层不依赖游戏，启动时建一次，一直用到程序结束；
 /// 每次进入世界都重新附加游戏进程、重建整个 Session。
 fn _main() -> Result<()> {
-    let window = overlay::create_window(overlay::SCREEN_W, overlay::SCREEN_H)?;
-    let mut renderer = renderer::Renderer::new(window, overlay::SCREEN_W, overlay::SCREEN_H)?;
-    let mut pacer = vsync::Pacer::new(renderer.present_mode == ash::vk::PresentModeKHR::MAILBOX, TARGET_FPS);
-    info!("frame pacing: {}", pacer.describe());
+    let mut overlay = android_overlay::Overlay::fullscreen(TARGET_FPS)?;
+    let (width, height) = overlay.size();
+    let aspect = width as f32 / height as f32;
 
     // 等待期间同样的原因只打印一次，避免每 2 秒刷一行
     let mut last_wait_reason = String::new();
@@ -65,10 +61,10 @@ fn _main() -> Result<()> {
         };
 
         // ---- 2. 进入世界：拿不到本地玩家说明在主菜单或者加载中，过一会儿再试 ----
-        match session::Session::start(proc) {
+        match session::Session::start(proc, aspect) {
             Ok(mut s) => {
                 last_wait_reason.clear();
-                s.run(&mut renderer, &mut pacer)?;
+                s.run(&mut overlay)?;
                 // run 返回 = 退出了世界。丢掉 Session，后台刷新线程随之结束
             }
             Err(e) => wait(&mut last_wait_reason, format!("not in a world yet ({e})")),

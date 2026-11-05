@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use crate::camera::Camera;
 use crate::interp::direction;
-use crate::renderer::Shape;
+use android_overlay::Shape;
 
 
 /// 骨架的体型

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ash = "0.38.0"
+android-overlay = { path = "../android-overlay" }
 libc = "0.2.190"
 thiserror = "2.0.21"
 # 只用 sync 模块里的 watch 通道，不需要异步运行时
@@ -13,8 +13,3 @@ time = { version = "0.3.55", features = ["macros"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["time"] }
-imgui = "0.12"
-imgui-rs-vulkan-renderer = "1.16"
-
-[build-dependencies]
-cc = "1.6.0"

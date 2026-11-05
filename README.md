@@ -6,6 +6,8 @@ Minecraft 基岩版（Android）的外部透视，用于单人世界下学习逆
 
 ## 构建和运行
 
+渲染层是独立项目 [`android-overlay`](../android-overlay)，要和本项目放在同一级目录下。屏幕分辨率在启动时自动获取。
+
 ```sh
 cargo ndk -t arm64-v8a -P 30 build --release
 ```
