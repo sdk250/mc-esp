@@ -112,8 +112,9 @@ impl Session {
 
     /// 每帧画框，直到检测到世界卸载才返回（Ok）。渲染出错时返回 Err
     pub fn run(&mut self, overlay: &mut Overlay) -> Result<()> {
+        // 游戏总是横屏的，投影用横屏的尺寸；手机此时可能还是竖屏，游戏回到前台后这个坐标系才对得上
         let (w, h) = overlay.size();
-        let (w, h) = (w as f32, h as f32);
+        let (w, h) = (w.max(h) as f32, w.min(h) as f32);
         // 视角取多久以前的值，用来抵消游戏自身的渲染延迟（见 interp::ViewHistory）。MC_ESP_VIEW_DELAY_MS 可以调
         let view_delay = Duration::from_millis(
             std::env::var("MC_ESP_VIEW_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_VIEW_DELAY_MS),

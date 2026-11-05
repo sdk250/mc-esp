@@ -45,8 +45,9 @@ fn main() {
 /// 每次进入世界都重新附加游戏进程、重建整个 Session。
 fn _main() -> Result<()> {
     let mut overlay = android_overlay::Overlay::fullscreen(TARGET_FPS)?;
+    // 游戏总是横屏的。覆盖层跟着屏幕旋转，启动时手机可能还是竖屏，所以取长边比短边
     let (width, height) = overlay.size();
-    let aspect = width as f32 / height as f32;
+    let aspect = width.max(height) as f32 / width.min(height) as f32;
 
     // 等待期间同样的原因只打印一次，避免每 2 秒刷一行
     let mut last_wait_reason = String::new();
